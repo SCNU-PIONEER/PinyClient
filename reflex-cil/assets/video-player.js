@@ -10,6 +10,20 @@
   var WS_PORT = 8765;
   var QUEUE_MAX = 30;      // 最大排队帧数
   var KEEP_SEC = 5;        // MSE 缓冲保留秒数
+  var MIME_CANDIDATES = [
+    'video/mp4; codecs="avc1.42C01F"',
+    'video/mp4; codecs="avc1.42E01F"',
+    'video/mp4; codecs="avc1.42E01E"'
+  ];
+
+  function selectMimeType() {
+    for (var index = 0; index < MIME_CANDIDATES.length; index++) {
+      if (MediaSource.isTypeSupported(MIME_CANDIDATES[index])) {
+        return MIME_CANDIDATES[index];
+      }
+    }
+    return MIME_CANDIDATES[0];
+  }
 
   /** 轮询等待 DOM 元素就绪 */
   function waitForElement(id, cb) {
@@ -31,6 +45,11 @@
     var sb = null;
     var queue = [];
     var retries = 0;
+    var mimeType = selectMimeType();
+
+    function trimQueue() {
+      while (queue.length > QUEUE_MAX) queue.shift();
+    }
 
     function appendNext() {
       if (!sb || sb.updating || queue.length === 0) return;
@@ -48,6 +67,9 @@
           }
         }
         sb.appendBuffer(chunk);
+        if (video.paused) {
+          video.play().catch(function () {});
+        }
       } catch (e) {
         if (e.name === 'QuotaExceededError') {
           try {
@@ -64,9 +86,10 @@
     ms.addEventListener('sourceopen', function () {
       console.log('[VideoPlayer] MediaSource sourceopen');
       try {
-        sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
-        console.log('[VideoPlayer] SourceBuffer 创建成功');
+        sb = ms.addSourceBuffer(mimeType);
+        console.log('[VideoPlayer] SourceBuffer 创建成功, mime=' + mimeType);
         sb.addEventListener('updateend', appendNext);
+        appendNext();
       } catch (e) {
         console.error('[VideoPlayer] MSE SourceBuffer 初始化失败:', e);
       }
@@ -87,18 +110,22 @@
       ws.onmessage = function (e) {
         if (!(e.data instanceof ArrayBuffer)) return;
         if (!sb) {
-          console.warn('[VideoPlayer] ⚠️ SourceBuffer 尚未就绪，丢弃帧');
+          queue.push(e.data);
+          trimQueue();
           return;
         }
         if (sb.updating || queue.length > 0) {
           queue.push(e.data);
-          // 控制队列长度，丢弃过旧帧
-          while (queue.length > QUEUE_MAX) queue.shift();
+          trimQueue();
         } else {
           try {
             sb.appendBuffer(e.data);
+            if (video.paused) {
+              video.play().catch(function () {});
+            }
           } catch (err) {
             queue.push(e.data);
+            trimQueue();
           }
         }
       };

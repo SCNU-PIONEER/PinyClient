@@ -31,6 +31,10 @@ _loop: Optional[asyncio.AbstractEventLoop] = None
 _async_queue: Optional[asyncio.Queue] = None
 _ws_clients: set = set()
 _ws_lock = threading.Lock()
+_init_segment: bytes = b""
+_init_segment_pending = bytearray()
+_init_segment_ready = False
+_init_segment_lock = threading.Lock()
 
 
 def _broadcast_chunk(chunk: bytes) -> None:
@@ -52,6 +56,56 @@ def _broadcast_chunk(chunk: bytes) -> None:
             pass
 
     loop.call_soon_threadsafe(_put)
+
+
+def _reset_init_segment() -> None:
+    global _init_segment, _init_segment_ready
+    with _init_segment_lock:
+        _init_segment = b""
+        _init_segment_pending.clear()
+        _init_segment_ready = False
+
+
+def _capture_init_segment(chunk: bytes) -> None:
+    global _init_segment, _init_segment_ready
+    with _init_segment_lock:
+        if _init_segment_ready:
+            return
+
+        _init_segment_pending.extend(chunk)
+
+        while len(_init_segment_pending) >= 8:
+            box_size = struct.unpack_from(">I", _init_segment_pending, 0)[0]
+            header_size = 8
+            if box_size == 1:
+                if len(_init_segment_pending) < 16:
+                    return
+                box_size = struct.unpack_from(">Q", _init_segment_pending, 8)[0]
+                header_size = 16
+            elif box_size == 0:
+                return
+
+            if box_size < header_size:
+                _init_segment_ready = True
+                return
+
+            if len(_init_segment_pending) < box_size:
+                return
+
+            box_type = bytes(_init_segment_pending[4:8]).decode("ascii", errors="ignore")
+            box = bytes(_init_segment_pending[:box_size])
+
+            if box_type == "moof":
+                _init_segment_ready = True
+                return
+
+            if box_type in {"ftyp", "moov", "free", "sidx"}:
+                _init_segment += box
+            else:
+                _init_segment_ready = True
+                return
+
+            del _init_segment_pending[:box_size]
 
 
 # ── FFmpeg subprocess ──────────────────────────────────────────────────────────
@@ -89,6 +143,7 @@ def _start_ffmpeg() -> Optional[subprocess.Popen]:
     if not ffmpeg_path:
         print("[VideoServer] ⚠️  未找到 ffmpeg，视频功能不可用。请安装 ffmpeg 并加入 PATH。")
         return None
+    _reset_init_segment()
     try:
         proc = subprocess.Popen(
             [ffmpeg_path] + _FFMPEG_ARGS,
@@ -112,6 +167,7 @@ def _ffmpeg_reader(proc: subprocess.Popen) -> None:
             chunk = proc.stdout.read(4096)
             if not chunk:
                 break
+            _capture_init_segment(chunk)
             _broadcast_chunk(chunk)
     except Exception:
         pass
@@ -247,6 +303,10 @@ async def _ws_handler(websocket, *_args) -> None:
         _ws_clients.add(websocket)
     print(f"[VideoServer] 🎥 视频客户端接入 (共 {len(_ws_clients)})")
     try:
+        with _init_segment_lock:
+            init_segment = _init_segment if _init_segment else b""
+        if init_segment:
+            await websocket.send(init_segment)
         await websocket.wait_closed()
     finally:
         with _ws_lock:
