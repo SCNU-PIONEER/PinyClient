@@ -15,6 +15,7 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
 from typing import Optional
 
 UDP_PORT = 3334
@@ -25,6 +26,10 @@ MAX_FRAME_BYTES = 6 * 1024 * 1024  # 6 MB
 MAX_BUFFERED_FRAMES = 64
 FRAME_TIMEOUT_S = 2.0
 CLEANUP_INTERVAL_S = 0.5
+FFMPEG_INPUT_QUEUE_MAX = 180
+FFMPEG_STALL_TIMEOUT_S = 6.0
+FFMPEG_WATCHDOG_INTERVAL_S = 1.0
+FFMPEG_INPUT_RESUME_RESTART_GAP_S = 2.5
 
 # ── Shared async state ─────────────────────────────────────────────────────────
 _loop: Optional[asyncio.AbstractEventLoop] = None
@@ -111,6 +116,11 @@ def _capture_init_segment(chunk: bytes) -> None:
 # ── FFmpeg subprocess ──────────────────────────────────────────────────────────
 _ffmpeg_proc: Optional[subprocess.Popen] = None
 _ffmpeg_lock = threading.Lock()
+_ffmpeg_input_queue: deque[bytes] = deque()
+_last_ffmpeg_input_at: float = 0.0
+_last_ffmpeg_output_at: float = 0.0
+_last_hevc_frame_at: float = 0.0
+_dropped_input_frames = 0
 
 _FFMPEG_ARGS = [
     "-loglevel", "warning",
@@ -139,6 +149,7 @@ _FFMPEG_ARGS = [
 
 
 def _start_ffmpeg() -> Optional[subprocess.Popen]:
+    global _last_ffmpeg_output_at
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
         print("[VideoServer] ⚠️  未找到 ffmpeg，视频功能不可用。请安装 ffmpeg 并加入 PATH。")
@@ -151,6 +162,7 @@ def _start_ffmpeg() -> Optional[subprocess.Popen]:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
+        _last_ffmpeg_output_at = time.monotonic()
         print(f"[VideoServer] ✅ FFmpeg 启动 (HEVC→H.264 frag MP4)")
         return proc
     except Exception as exc:
@@ -160,6 +172,7 @@ def _start_ffmpeg() -> Optional[subprocess.Popen]:
 
 def _ffmpeg_reader(proc: subprocess.Popen) -> None:
     """Background thread: read FFmpeg stdout and broadcast chunks."""
+    global _last_ffmpeg_output_at
     if proc.stdout is None:
         return
     try:
@@ -167,38 +180,135 @@ def _ffmpeg_reader(proc: subprocess.Popen) -> None:
             chunk = proc.stdout.read(4096)
             if not chunk:
                 break
+            _last_ffmpeg_output_at = time.monotonic()
             _capture_init_segment(chunk)
             _broadcast_chunk(chunk)
     except Exception:
         pass
 
 
-def _write_hevc_frame(frame: bytes) -> None:
-    """Write a reassembled HEVC frame to FFmpeg stdin. Restarts FFmpeg if needed."""
-    global _ffmpeg_proc
-
-    with _ffmpeg_lock:
-        proc = _ffmpeg_proc
-
-    if proc is None or proc.poll() is not None:
-        with _ffmpeg_lock:
-            _ffmpeg_proc = _start_ffmpeg()
-            if _ffmpeg_proc:
-                threading.Thread(
-                    target=_ffmpeg_reader, args=(_ffmpeg_proc,), daemon=True
-                ).start()
-        with _ffmpeg_lock:
-            proc = _ffmpeg_proc
-
-    if proc is None:
-        return
-
+def _stop_ffmpeg_process(proc: subprocess.Popen) -> None:
     try:
         if proc.stdin is not None:
-            proc.stdin.write(frame)
-            proc.stdin.flush()
+            proc.stdin.close()
     except Exception:
         pass
+
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _ensure_ffmpeg_running_locked() -> Optional[subprocess.Popen]:
+    global _ffmpeg_proc
+    if _ffmpeg_proc is not None and _ffmpeg_proc.poll() is None:
+        return _ffmpeg_proc
+
+    if _ffmpeg_proc is not None:
+        _stop_ffmpeg_process(_ffmpeg_proc)
+
+    _ffmpeg_proc = _start_ffmpeg()
+    if _ffmpeg_proc is not None:
+        threading.Thread(target=_ffmpeg_reader, args=(_ffmpeg_proc,), daemon=True).start()
+    return _ffmpeg_proc
+
+
+def _restart_ffmpeg(reason: str) -> None:
+    global _ffmpeg_proc
+    with _ffmpeg_lock:
+        old = _ffmpeg_proc
+        _ffmpeg_proc = None
+        _reset_init_segment()
+        if old is not None:
+            _stop_ffmpeg_process(old)
+        new_proc = _ensure_ffmpeg_running_locked()
+    if new_proc is not None:
+        print(f"[VideoServer] 🔁 FFmpeg 已重启: {reason}")
+
+
+def _enqueue_hevc_frame(frame: bytes) -> None:
+    global _last_ffmpeg_input_at, _dropped_input_frames
+    with _ffmpeg_lock:
+        if len(_ffmpeg_input_queue) >= FFMPEG_INPUT_QUEUE_MAX:
+            _ffmpeg_input_queue.popleft()
+            _dropped_input_frames += 1
+            if _dropped_input_frames % 30 == 0:
+                print(f"[VideoServer] ⚠️ FFmpeg 输入队列拥塞，累计丢帧 {_dropped_input_frames}")
+        _ffmpeg_input_queue.append(frame)
+        _last_ffmpeg_input_at = time.monotonic()
+
+
+def _ffmpeg_writer_thread() -> None:
+    while True:
+        frame: Optional[bytes] = None
+        proc: Optional[subprocess.Popen] = None
+
+        with _ffmpeg_lock:
+            if _ffmpeg_input_queue:
+                frame = _ffmpeg_input_queue.popleft()
+            proc = _ensure_ffmpeg_running_locked()
+
+        if frame is None:
+            time.sleep(0.002)
+            continue
+
+        if proc is None or proc.stdin is None:
+            continue
+
+        try:
+            proc.stdin.write(frame)
+        except Exception as exc:
+            with _ffmpeg_lock:
+                if len(_ffmpeg_input_queue) < FFMPEG_INPUT_QUEUE_MAX:
+                    _ffmpeg_input_queue.appendleft(frame)
+            _restart_ffmpeg(f"stdin write failed: {exc}")
+
+
+def _ffmpeg_watchdog_thread() -> None:
+    while True:
+        time.sleep(FFMPEG_WATCHDOG_INTERVAL_S)
+        now = time.monotonic()
+        should_restart = False
+
+        with _ffmpeg_lock:
+            proc = _ffmpeg_proc
+            no_output_for = now - _last_ffmpeg_output_at if _last_ffmpeg_output_at else 0.0
+            no_input_for = now - _last_ffmpeg_input_at if _last_ffmpeg_input_at else 0.0
+
+            if proc is not None and proc.poll() is not None:
+                should_restart = True
+            elif proc is not None and no_output_for > FFMPEG_STALL_TIMEOUT_S and no_input_for < FFMPEG_STALL_TIMEOUT_S * 2:
+                should_restart = True
+
+        if should_restart:
+            _restart_ffmpeg("watchdog detected stalled transcoder")
+
+
+def _write_hevc_frame(frame: bytes) -> None:
+    """Queue HEVC frame and let writer thread feed FFmpeg asynchronously."""
+    global _last_hevc_frame_at
+    now = time.monotonic()
+    should_restart_on_resume = False
+
+    with _ffmpeg_lock:
+        if _last_hevc_frame_at > 0 and now - _last_hevc_frame_at > FFMPEG_INPUT_RESUME_RESTART_GAP_S:
+            should_restart_on_resume = True
+        _last_hevc_frame_at = now
+
+    # 输入流长时间中断后恢复，主动重启转码器以避免 HEVC 解码状态卡死。
+    if should_restart_on_resume:
+        _restart_ffmpeg("input resumed after gap")
+
+    _enqueue_hevc_frame(frame)
 
 
 # ── UDP receiver / frame reassembly ───────────────────────────────────────────
@@ -289,7 +399,7 @@ async def _broadcaster() -> None:
         dead: set = set()
         for ws in clients:
             try:
-                await ws.send(chunk)
+                await asyncio.wait_for(ws.send(chunk), timeout=1.0)
             except Exception:
                 dead.add(ws)
         if dead:
@@ -345,11 +455,10 @@ def start() -> None:
 
     # Start FFmpeg and its stdout reader
     with _ffmpeg_lock:
-        _ffmpeg_proc = _start_ffmpeg()
-        if _ffmpeg_proc:
-            threading.Thread(
-                target=_ffmpeg_reader, args=(_ffmpeg_proc,), daemon=True
-            ).start()
+        _ffmpeg_proc = _ensure_ffmpeg_running_locked()
+
+    threading.Thread(target=_ffmpeg_writer_thread, daemon=True).start()
+    threading.Thread(target=_ffmpeg_watchdog_thread, daemon=True).start()
 
     # Start UDP receiver
     threading.Thread(target=_udp_thread, daemon=True).start()

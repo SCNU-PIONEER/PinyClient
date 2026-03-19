@@ -10,6 +10,8 @@
   var WS_PORT = 8765;
   var QUEUE_MAX = 30;      // 最大排队帧数
   var KEEP_SEC = 5;        // MSE 缓冲保留秒数
+  var STALL_TIMEOUT_MS = 8000;
+  var STALL_CHECK_INTERVAL_MS = 2000;
   var MIME_CANDIDATES = [
     'video/mp4; codecs="avc1.42C01F"',
     'video/mp4; codecs="avc1.42E01F"',
@@ -41,9 +43,14 @@
     video.autoplay = true;
     console.log('[VideoPlayer] 找到 video 元素，开始初始化 MSE');
 
-    var ms = new MediaSource();
+    var ms = null;
     var sb = null;
     var queue = [];
+    var ws = null;
+    var reconnectTimer = null;
+    var stallTimer = null;
+    var lastPacketAt = 0;
+    var receivedFrameInSession = false;
     var retries = 0;
     var mimeType = selectMimeType();
 
@@ -83,32 +90,75 @@
       }
     }
 
-    ms.addEventListener('sourceopen', function () {
-      console.log('[VideoPlayer] MediaSource sourceopen');
-      try {
-        sb = ms.addSourceBuffer(mimeType);
-        console.log('[VideoPlayer] SourceBuffer 创建成功, mime=' + mimeType);
-        sb.addEventListener('updateend', appendNext);
-        appendNext();
-      } catch (e) {
-        console.error('[VideoPlayer] MSE SourceBuffer 初始化失败:', e);
-      }
-    });
+    function initMediaSource() {
+      ms = new MediaSource();
+      sb = null;
+      queue = [];
 
-    video.src = URL.createObjectURL(ms);
+      ms.addEventListener('sourceopen', function () {
+        console.log('[VideoPlayer] MediaSource sourceopen');
+        try {
+          sb = ms.addSourceBuffer(mimeType);
+          console.log('[VideoPlayer] SourceBuffer 创建成功, mime=' + mimeType);
+          sb.addEventListener('updateend', appendNext);
+          appendNext();
+        } catch (e) {
+          console.error('[VideoPlayer] MSE SourceBuffer 初始化失败:', e);
+        }
+      });
+
+      video.src = URL.createObjectURL(ms);
+    }
+
+    function resetMediaSource() {
+      try {
+        if (sb && sb.updating) {
+          sb.abort();
+        }
+      } catch (_) {}
+
+      try {
+        if (ms && ms.readyState === 'open') {
+          ms.endOfStream();
+        }
+      } catch (_) {}
+
+      initMediaSource();
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      var delay = Math.min(500 * Math.pow(2, retries), 16000);
+      retries++;
+      reconnectTimer = setTimeout(function () {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+      console.log('[VideoPlayer] WebSocket 断开，' + delay + 'ms 后重连');
+    }
+
+    initMediaSource();
 
     function connect() {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
       var wsUrl = 'ws://' + location.hostname + ':' + WS_PORT;
-      var ws = new WebSocket(wsUrl);
+      ws = new WebSocket(wsUrl);
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = function () {
         retries = 0;
+        lastPacketAt = 0;
+        receivedFrameInSession = false;
         console.log('[VideoPlayer] WebSocket 已连接 ' + wsUrl + '  sb就绪=' + !!sb);
       };
 
       ws.onmessage = function (e) {
         if (!(e.data instanceof ArrayBuffer)) return;
+        receivedFrameInSession = true;
+        lastPacketAt = Date.now();
         if (!sb) {
           queue.push(e.data);
           trimQueue();
@@ -131,15 +181,35 @@
       };
 
       ws.onclose = function () {
-        var delay = Math.min(500 * Math.pow(2, retries), 16000);
-        retries++;
-        console.log('[VideoPlayer] WebSocket 断开，' + delay + 'ms 后重连');
-        setTimeout(connect, delay);
+        ws = null;
+        scheduleReconnect();
       };
 
-      ws.onerror = function () { ws.close(); };
+      ws.onerror = function () {
+        try { ws.close(); } catch (_) {}
+      };
     }
 
+    stallTimer = setInterval(function () {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!receivedFrameInSession) return;
+      if (!lastPacketAt) return;
+
+      if (Date.now() - lastPacketAt > STALL_TIMEOUT_MS) {
+        console.warn('[VideoPlayer] 检测到视频流超时，执行自愈重连');
+        resetMediaSource();
+        try { ws.close(); } catch (_) {}
+      }
+    }, STALL_CHECK_INTERVAL_MS);
+
     connect();
+
+    window.addEventListener('beforeunload', function () {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (stallTimer) clearInterval(stallTimer);
+      if (ws) {
+        try { ws.close(); } catch (_) {}
+      }
+    });
   });
 })();

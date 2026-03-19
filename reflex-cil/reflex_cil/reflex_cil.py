@@ -266,7 +266,7 @@ def ammo_action_cell(title: str, value: Any, on_change, on_click) -> rx.Componen
                 placeholder="0",
             ),
             rx.button(title, class_name="ammo-send", on_click=on_click),
-            spacing="0",
+            spacing="1",
             class_name="ammo-cell-content",
         ),
         class_name="cell ammo-cell",
@@ -284,7 +284,7 @@ def select_cell(
         value=value,
         placeholder=placeholder,
         on_change=on_change,
-        class_name=rx.cond(value == "", "cell select-cell select-placeholder", "cell select-cell"),
+        class_name=rx.cond(value == "", "select-cell select-placeholder", "select-cell"),
     )
 
 
@@ -325,7 +325,7 @@ def index() -> rx.Component:
                 rx.grid(
                     ammo_action_cell("17mm", DashboardState.ammo_17_display, DashboardState.set_17mm_amount, DashboardState.send_17mm),
                     ammo_action_cell("42mm", DashboardState.ammo_42_display, DashboardState.set_42mm_amount, DashboardState.send_42mm),
-                    action_button("免费复活", on_click=DashboardState.send_respawn, disabled=~DashboardState.can_respawn),
+                    action_button("立即复活", on_click=DashboardState.send_respawn, disabled=~DashboardState.can_respawn),
                     action_button(
                         rx.vstack(
                             rx.text("金币复活"),
@@ -335,51 +335,66 @@ def index() -> rx.Component:
                         on_click=DashboardState.send_gold_respawn,
                         disabled=~DashboardState.can_pay_for_respawn,
                     ),
-                    action_button("远程补弹", on_click=DashboardState.send_remote_ammo, disabled=~DashboardState.can_remote_ammo),
                     action_button("远程补血", on_click=DashboardState.send_remote_heal, disabled=~DashboardState.can_remote_heal),
                     action_button("能量机关", on_click=DashboardState.activate_rune),
-                    action_button(""),
-                    action_button(""),
+                    rx.box(class_name="cell"),
+                    rx.box(class_name="cell"),
+                    rx.box(class_name="cell"),
                     class_name="actions",
                 ),
                 rx.grid(
-                    select_cell(
-                        "发射机构选项",
-                        ["冷却优先", "爆发优先", "英雄近战优先", "英雄远程优先"],
-                        DashboardState.launcher_option,
-                        DashboardState.set_launcher_option,
+                    rx.box(
+                        select_cell(
+                            "发射机构选项",
+                            ["冷却优先", "爆发优先", "英雄近战优先", "英雄远程优先"],
+                            DashboardState.launcher_option,
+                            DashboardState.set_launcher_option,
+                        ),
+                        class_name="cell dropdown-select-cell",
                     ),
-                    select_cell(
-                        "底盘选项",
-                        ["血量优先", "功率优先", "英雄近战优先", "英雄远程优先"],
-                        DashboardState.chassis_option,
-                        DashboardState.set_chassis_option,
+                    rx.box(
+                        select_cell(
+                            "底盘选项",
+                            ["血量优先", "功率优先", "英雄近战优先", "英雄远程优先"],
+                            DashboardState.chassis_option,
+                            DashboardState.set_chassis_option,
+                        ),
+                        class_name="cell dropdown-select-cell",
                     ),
-                    action_button(""),
-                    action_button(""),
+                    rx.box(class_name="cell"),
+                    rx.box(class_name="cell"),
                     class_name="dropdowns",
                 ),
                 rx.grid(
                     rx.box(
-                        rx.hstack(
-                            select_cell(
-                                "飞镖目标",
-                                ["前哨", "基地固定", "基地随机固定", "基地随机移动", "基地末端移动"],
-                                DashboardState.dart_target,
-                                DashboardState.set_dart_target,
+                        rx.box(
+                            rx.flex(
+                                select_cell(
+                                    "飞镖目标",
+                                    ["前哨", "基地固定", "随机固定", "随机移动", "末端移动"],
+                                    DashboardState.dart_target,
+                                    DashboardState.set_dart_target,
+                                ),
+                                rx.box(
+                                    rx.box(class_name=DashboardState.dart_indicator_class),
+                                    class_name="dart-indicator-slot",
+                                ),
+                                direction="row",
+                                align="center",
+                                justify="start",
+                                class_name="dart-target-row",
                             ),
-                            rx.box(class_name=DashboardState.dart_indicator_class),
-                            class_name="dart-target-row",
+                            class_name="dart-target-shell",
                         ),
-                        class_name="dart-select-cell",
+                        class_name="cell dart-select-cell",
                     ),
                     rx.grid(
                         action_button("开闸", on_click=DashboardState.open_dart_gate),
                         action_button("发射", on_click=DashboardState.launch_dart),
                         class_name="dart-second-row",
                     ),
-                    action_button(""),
-                    action_button(""),
+                    rx.box(class_name="cell"),
+                    rx.box(class_name="cell"),
                     class_name="dart",
                 ),
                 rx.grid(
@@ -402,8 +417,8 @@ def index() -> rx.Component:
                         action_button("退出", on_click=DashboardState.disable_deploy),
                         class_name="control-second-row",
                     ),
-                    action_button(""),
-                    action_button(""),
+                    rx.box(class_name="cell"),
+                    rx.box(class_name="cell"),
                     class_name="control",
                 ),
                 class_name="panel bottom-left",
