@@ -5,5 +5,71 @@
             "envManager": "ms-python.python:conda",
             "packageManager": "ms-python.python:conda"
         }
-    ]
+    ],
+    "python.testing.unittestArgs": [
+        "-v",
+        "-s",
+        "./backend",
+        "-p",
+        "test*.py"
+    ],
+    "python.testing.pytestEnabled": false,
+    "python.testing.unittestEnabled": true,
+    "editor.fontSize": 14,
+    "editor.formatOnSave": true,
+    "workbench.tree.indent": 15,
+    "workbench.tree.renderIndentGuides": "always",
+    "workbench.colorCustomizations": {
+        "activityBar.foreground": "#f4ba94",
+        "activityBarBadge.background": "#002FA7",
+        "activityBar.activeBorder": "#fa973a",
+        // -------------------------------------
+        // "sideBar.background": "#1e1e1e",
+        // "sideBar.foreground": "#002FA7",
+        // "sideBar.border": "#fa973a",
+        "sideBarTitle.foreground": "#fa973a",
+        // -------------------------------------
+        "tree.indentGuidesStroke": "#05ef3c",
+        "tree.indentGuidesBackground": "red",
+        "tree.indentGuidesBackgroundSelected": "blue",
+        // -------------------------------------
+        // "terminal.background": "#1e1e1e",
+        "terminal.foreground": "#d38c49",
+        "terminalCursor.foreground": "#fa973a",
+        "terminal.selectionBackground": "#fa973a",
+        // -------------------------------------
+        // "editor.background": "#1e1e1e",
+        // "editor.foreground": "#002FA7",
+        "editorCursor.foreground": "#fa973a",
+        // "editor.selectionBackground": "#d38c49",
+        // "editor.selectionHighlightBackground": "#fa973a",
+        // --------------------------------------
+        // "titleBar.activeBackground": "#fa973a",
+        "titleBar.activeForeground": "#d38c49",
+    },
+    "editor.fontFamily": "Fira Code",
+    "editor.fontLigatures": true,
+    "files.watcherExclude": {
+        "**/.web/**": true,
+        "**/.states/**": true,
+        "**/__pycache__/**": true,
+        "**/node_modules/**": true,
+        // "**/.vscode/**": true
+        "**/old/**": true
+    },
+    "files.exclude": {
+        "**/.web": true,
+        "**/.states": true,
+        "**/__pycache__/**": true,
+        "**/node_modules/**": true,
+        // "**/old/**": true
+        "**/.vscode": true,
+    },
+    "search.exclude": {
+        "**/.web": true,
+        "**/.states": true,
+        "**/__pycache__/**": true,
+        "**/node_modules/**": true,
+        "**/old/**": true
+    },
 }

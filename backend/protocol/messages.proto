@@ -96,6 +96,8 @@ message AirSupportCommand {
     uint32 command_id = 1;
 }
 
+// =================================================
+
 // === 下行消息 (Server -> Client) ===
 
 // 比赛全局状态 (5Hz)
