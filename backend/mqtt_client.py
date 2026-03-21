@@ -11,7 +11,6 @@ import time
 import random
 import threading
 import queue
-from dataclasses import dataclass
 from typing import Callable, Dict, Any
 
 import paho.mqtt.client as mqtt
@@ -22,52 +21,142 @@ from protobuf_models import DOWN_TOPIC2MODEL_MAP, UPLINK_TOPIC2MODEL_MAP
 
 
 # ============================================================
-# 彩色日志配置
+# 彩色日志配置 (增强版)
 # ============================================================
-def _setup_logger(name: str = "pioneer") -> logging.Logger:
-    """
-    配置彩色日志，支持通过 PIONEER_LOG_LEVEL 环境变量切换级别。
-    生产环境设为 INFO，调试时设为 DEBUG。
-    """
-    _COLORS = {
+class ColorLogger:
+    """彩色日志生成器，支持分组配色方案"""
+
+    # 基础色
+    C = {
         "RESET":   "\033[0m",
-        "RED":     "\033[91m",
-        "GREEN":   "\033[92m",
-        "YELLOW":  "\033[93m",
-        "BLUE":    "\033[94m",
-        "MAGENTA": "\033[95m",
-        "CYAN":    "\033[96m",
-        "GRAY":    "\033[90m",
+        "BOLD":    "\033[1m",
+        "DIM":     "\033[2m",
+        "ITALIC":  "\033[3m",
+        "UNDER":   "\033[4m",
+
+        # 前景色
+        "BLACK":   "\033[30m",
+        "RED":     "\033[31m",
+        "GREEN":   "\033[32m",
+        "YELLOW":  "\033[33m",
+        "BLUE":    "\033[34m",
+        "MAGENTA": "\033[35m",
+        "CYAN":    "\033[36m",
+        "WHITE":   "\033[37m",
+
+        # 亮色
+        "BRIGHT_RED":     "\033[91m",
+        "BRIGHT_GREEN":   "\033[92m",
+        "BRIGHT_YELLOW":  "\033[93m",
+        "BRIGHT_BLUE":    "\033[94m",
+        "BRIGHT_MAGENTA": "\033[95m",
+        "BRIGHT_CYAN":    "\033[96m",
+        "GRAY":           "\033[90m",
+
+        # 背景色
+        "BG_RED":     "\033[41m",
+        "BG_GREEN":   "\033[42m",
+        "BG_YELLOW":  "\033[43m",
+        "BG_BLUE":    "\033[44m",
+        "BG_MAGENTA": "\033[45m",
+        "BG_CYAN":    "\033[46m",
     }
-    _LEVEL_COLOR = {
-        "DEBUG":   _COLORS["GRAY"],
-        "INFO":    _COLORS["BLUE"],
-        "WARNING": _COLORS["YELLOW"],
-        "ERROR":   _COLORS["RED"],
-        "CRITICAL": _COLORS["MAGENTA"],
+
+    # 分组配色方案
+    THEMES = {
+        # DEBUG 组：柔和灰蓝
+        "DEBUG": {
+            "time":  f"{C['GRAY']}{C['DIM']}",
+            "level": f"{C['GRAY']}",
+            "name":  f"{C['GRAY']}{C['ITALIC']}",
+            "msg":   f"{C['GRAY']}",
+        },
+        # INFO 组：清新蓝绿
+        "INFO": {
+            "time":  f"{C['CYAN']}{C['BOLD']}",
+            "level": f"{C['BRIGHT_BLUE']}{C['BOLD']}",
+            "name":  f"{C['BRIGHT_CYAN']}",
+            "msg":   f"{C['WHITE']}",
+        },
+        # WARNING 组：活力黄橙
+        "WARNING": {
+            "time":  f"{C['YELLOW']}{C['BOLD']}",
+            "level": f"{C['BRIGHT_YELLOW']}{C['BOLD']}",
+            "name":  f"{C['YELLOW']}",
+            "msg":   f"{C['YELLOW']}",
+        },
+        # ERROR 组：醒目红紫
+        "ERROR": {
+            "time":  f"{C['RED']}{C['BOLD']}",
+            "level": f"{C['BRIGHT_RED']}{C['BOLD']}{C['UNDER']}",
+            "name":  f"{C['MAGENTA']}",
+            "msg":   f"{C['BRIGHT_RED']}",
+        },
+        # CRITICAL 组：最强红白
+        "CRITICAL": {
+            "time":  f"{C['RED']}{C['BOLD']}",
+            "level": f"{C['BG_RED']}{C['WHITE']}{C['BOLD']}",
+            "name":  f"{C['BRIGHT_RED']}{C['BOLD']}",
+            "msg":   f"{C['WHITE']}{C['BOLD']}",
+        },
     }
 
-    logger = logging.getLogger(name)
-    level_str = os.environ.get("PIONEER_LOG_LEVEL", "INFO").upper()
-    logger.setLevel(getattr(logging, level_str, logging.INFO))
-    logger.handlers.clear()
+    def __init__(self, name: str = "pioneer"):
+        self.name = name
+        self._logger = logging.getLogger(name)
+        self._configure()
 
-    class ColorFormatter(logging.Formatter):
-        def format(self, record):
-            color = _LEVEL_COLOR.get(record.levelname, _COLORS["RESET"])
-            record.levelname = f"{color}{record.levelname}{_COLORS['RESET']}"
-            record.name = f"{_COLORS['CYAN']}{record.name}{_COLORS['RESET']}"
-            return super().format(record)
+    def _configure(self):
+        level_str = os.environ.get("PIONEER_LOG_LEVEL", "INFO").upper()
+        self._logger.setLevel(getattr(logging, level_str, logging.INFO))
+        self._logger.handlers.clear()
 
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    fmt = "%(asctime)s | %(levelname)-10s | %(name)s | %(message)s"
-    handler.setFormatter(ColorFormatter(fmt, datefmt="%H:%M:%S"))
-    logger.addHandler(handler)
-    return logger
+        class MultiColorFormatter(logging.Formatter):
+            def format(self, record):
+                # 先手动设置 asctime 属性
+                if not hasattr(record, 'asctime'):
+                    # 创建时间字符串
+                    record.asctime = self.formatTime(record, self.datefmt)
+                
+                theme = ColorLogger.THEMES.get(record.levelname, ColorLogger.THEMES["INFO"])
+                C = ColorLogger.C
 
+                # 时间：彩色
+                asctime = f"{theme['time']}{record.asctime}{C['RESET']}"
+                # 级别：彩色 + 加粗
+                levelname = f"{theme['level']}{record.levelname:10s}{C['RESET']}"
+                # 模块名：彩色
+                name = f"{theme['name']}{record.name}{C['RESET']}"
+                # 消息：彩色
+                message = f"{theme['msg']}{record.getMessage()}{C['RESET']}"
 
-logger = _setup_logger()
+                # 重新组装
+                return f"{asctime} | {levelname} | {name} | {message}"
+
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.DEBUG)
+        # 格式：[时间] | 级别 | 模块名 | 消息
+        fmt = "%(asctime)s | %(levelname)-10s | %(name)s | %(message)s"
+        handler.setFormatter(MultiColorFormatter(fmt, datefmt="%H:%M:%S"))
+        self._logger.addHandler(handler)
+
+    def debug(self, msg, *args, **kwargs):
+        self._logger.debug(msg, *args, **kwargs)
+
+    def info(self, msg, *args, **kwargs):
+        self._logger.info(msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        self._logger.warning(msg, *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        self._logger.error(msg, *args, **kwargs)
+
+    def critical(self, msg, *args, **kwargs):
+        self._logger.critical(msg, *args, **kwargs)
+
+# 全局日志实例
+logger = ColorLogger("pioneer")
 
 
 # ============================================================
@@ -106,6 +195,7 @@ UPLINK_TOPICS = {
     "MapRadarMarkCommand", "AirsupportCommand",
     "TechCoreAssembleOperationCommand",
 }
+
 
 # ============================================================
 # 主类
@@ -223,8 +313,6 @@ class RoboMasterMQTT:
     def _register_callbacks(self) -> None:
         """
         批量注册所有 topic 的回调。
-        所有 topic 共用同一个解析函数，保持代码简洁；
-        特殊逻辑可在各自回调中添加。
         """
         def parse_and_update(topic: str, payload: bytes) -> None:
             """解析 Protobuf 消息并更新状态机。"""
@@ -242,15 +330,21 @@ class RoboMasterMQTT:
 
             # 按配置更新状态机
             update_spec = self.UPDATE_ITEMS.get(topic, ALL_STATES)
+            
             if update_spec == ALL_STATES:
+                # 全量更新：转为嵌套字典 {topic: {...}}
                 msg_dict = MessageToDict(msg, preserving_proto_field_name=True)
-                self.states.update(msg_dict)
-                logger.debug("[%s] 全量更新: %s", topic, msg_dict)
+                self.states.update({topic: msg_dict})
+                logger.debug("[%s] 全量更新", topic)
             elif isinstance(update_spec, list):
+                # 选择性更新：只提取指定字段
+                nested = {}
                 for field in update_spec:
                     val = getattr(msg, field, None)
-                    self.states.update({field: val})
-                logger.debug("[%s] 选择更新: %s", topic, update_spec)
+                    if val is not None:
+                        nested[field] = val
+                self.states.update({topic: nested})
+                logger.debug("[%s] 选择更新: %s", topic, list(nested.keys()))
 
         for topic in DOWNLINK_TOPICS:
             self._callbacks[topic] = lambda payload, t=topic: parse_and_update(t, payload)
@@ -262,7 +356,10 @@ class RoboMasterMQTT:
     def state_update(self, state, msgs: Any = None) -> None:
         """兼容旧 API，内部转发给状态机。"""
         if state == ALL_STATES and msgs is not None:
-            self.states.update(MessageToDict(msgs, preserving_proto_field_name=True))
+            # 尝试推断 topic 名称
+            topic = type(msgs).__name__
+            msg_dict = MessageToDict(msgs, preserving_proto_field_name=True)
+            self.states.update({topic: msg_dict})
 
     # --------------------------------------------------------
     # 发送指令
