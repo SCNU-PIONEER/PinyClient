@@ -11,23 +11,29 @@ import time
 import random
 import threading
 import queue
+from token import NAME
 from typing import Callable, Dict, Any
 
 import paho.mqtt.client as mqtt
 from google.protobuf.json_format import MessageToDict
 
-from states import (
+from datas.rm_states import (  # pyright: ignore[reportImplicitRelativeImport]
     RMClientStates, RED, BLUE, ALLY, ALL_STATES,
-    CLIENT_ID_TO_NAME, NAME_TO_ID, NAME_TO_CLIENT_ID
+    CLIENT_ID_TO_NAME, NAME_TO_ID, NAME_TO_CLIENT_ID,
+    RED_HERO, BLUE_HERO, RED_SENTRY, BLUE_SENTRY, 
+    RED_DART, BLUE_DART, RED_AIR, BLUE_AIR, 
+    RED_INFANTRY, BLUE_INFANTRY, RED_BASE, BLUE_BASE,
+    RED_ENGINEER, BLUE_ENGINEER, RED_OUTPOST, BLUE_OUTPOST,
+    RED_RADAR, BLUE_RADAR
 )
-from backend.protobuf_models import DOWN_TOPIC2MODEL_MAP, UPLINK_TOPIC2MODEL_MAP
+from protocol.protobuf_models import DOWN_TOPIC2MODEL_MAP, UPLINK_TOPIC2MODEL_MAP  # pyright: ignore[reportImplicitRelativeImport]
 
 
 # ============================================================
-# 彩色日志配置 (增强版)
+# 彩色日志
 # ============================================================
 class ColorLogger:
-    """彩色日志生成器, 支持分组配色方案"""
+    """彩色日志生成器, 支持分组配色方案; 在命令行使用$env:PIONEER_LOG_LEVEL = "DEBUG"命令 """
 
     # 基础色
     C: dict[str, str]= {
@@ -72,35 +78,40 @@ class ColorLogger:
             "time":  f"{C['GRAY']}{C['DIM']}",
             "level": f"{C['GRAY']}",
             "name":  f"{C['GRAY']}{C['ITALIC']}",
+            "file":  f"{C['GRAY']}{C['DIM']}",
             "msg":   f"{C['GRAY']}",
         },
         # INFO 组：清新蓝绿
         "INFO": {
-            "time":  f"{C['CYAN']}{C['BOLD']}",
+            "time":  f"{C['BRIGHT_CYAN']}{C['BOLD']}",
             "level": f"{C['BRIGHT_BLUE']}{C['BOLD']}",
-            "name":  f"{C['BRIGHT_CYAN']}",
+            "name":  f"{C['CYAN']}",
+            "file":  f"{C['GRAY']}{C['ITALIC']}",
             "msg":   f"{C['WHITE']}",
         },
         # WARNING 组：活力黄橙
         "WARNING": {
-            "time":  f"{C['YELLOW']}{C['BOLD']}",
-            "level": f"{C['BRIGHT_YELLOW']}{C['BOLD']}",
-            "name":  f"{C['YELLOW']}",
-            "msg":   f"{C['YELLOW']}",
+            "time":  f"{C['BRIGHT_YELLOW']}{C['BOLD']}",
+            "level": f"{C['YELLOW']}{C['BOLD']}",
+            "name":  f"{C['BRIGHT_YELLOW']}",
+            "file":  f"{C['YELLOW']}",
+            "msg":   f"{C['BRIGHT_YELLOW']}",
         },
         # ERROR 组：醒目红紫
         "ERROR": {
-            "time":  f"{C['RED']}{C['BOLD']}",
-            "level": f"{C['BRIGHT_RED']}{C['BOLD']}{C['UNDER']}",
+            "time":  f"{C['BRIGHT_RED']}{C['BOLD']}",
+            "level": f"{C['RED']}{C['BOLD']}{C['UNDER']}",
             "name":  f"{C['MAGENTA']}",
+            "file":  f"{C['RED']}",
             "msg":   f"{C['BRIGHT_RED']}",
         },
         # CRITICAL 组：最强红白
         "CRITICAL": {
-            "time":  f"{C['RED']}{C['BOLD']}",
-            "level": f"{C['BG_RED']}{C['WHITE']}{C['BOLD']}",
-            "name":  f"{C['BRIGHT_RED']}{C['BOLD']}",
-            "msg":   f"{C['WHITE']}{C['BOLD']}",
+            "time":  f"{C['WHITE']}{C['BOLD']}{C['BG_RED']}",
+            "level": f"{C['WHITE']}{C['BOLD']}{C['BG_RED']}",
+            "name":  f"{C['BRIGHT_RED']}{C['BOLD']}{C['BG_RED']}",
+            "file":  f"{C['WHITE']}{C['BOLD']}{C['BG_RED']}",
+            "msg":   f"{C['WHITE']}{C['BOLD']}{C['BG_RED']}",
         },
     }
 
@@ -120,26 +131,28 @@ class ColorLogger:
                 if not hasattr(record, 'asctime'):
                     # 创建时间字符串
                     record.asctime = self.formatTime(record, self.datefmt)
-                
+
                 theme = ColorLogger.THEMES.get(record.levelname, ColorLogger.THEMES["INFO"])
                 C = ColorLogger.C
 
                 # 时间：彩色
                 asctime = f"{theme['time']}{record.asctime}{C['RESET']}"
                 # 级别：彩色 + 加粗
-                levelname = f"{theme['level']}{record.levelname:10s}{C['RESET']}"
+                levelname = f"{theme['level']}{record.levelname:8s}{C['RESET']}"
                 # 模块名：彩色
                 name = f"{theme['name']}{record.name}{C['RESET']}"
+                # 文件名和行号：彩色
+                filename = f"{theme['file']}{record.filename}:{record.lineno}{C['RESET']}"
                 # 消息：彩色
                 message = f"{theme['msg']}{record.getMessage()}{C['RESET']}"
 
                 # 重新组装
-                return f"{asctime} | {levelname} | {name} | {message}"
+                return f"{asctime} | {levelname} | {name} | {filename} | {message}"
 
         handler = logging.StreamHandler()
         handler.setLevel(logging.DEBUG)
-        # 格式：[时间] | 级别 | 模块名 | 消息
-        fmt = "%(asctime)s | %(levelname)-10s | %(name)s | %(message)s"
+        # 格式：[时间] | 级别 | 模块名 | 文件名:行号 | 消息
+        fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(lineno)d | %(message)s"
         handler.setFormatter(MultiColorFormatter(fmt, datefmt="%H:%M:%S"))
         self._logger.addHandler(handler)
 
@@ -159,14 +172,11 @@ class ColorLogger:
         self._logger.critical(msg, *args, **kwargs)
 
 # 全局日志实例
-logger = ColorLogger("pioneer")
-
+logger = ColorLogger("MQTTClient")
 
 # ============================================================
-# 常量 (已迁移到 states.py, 此处保留向下兼容)
+# 常量 
 # ============================================================
-# NAME_TO_ID, CLIENT_ID_TO_NAME, NAME_TO_CLIENT_ID, ID_TO_NAME
-# 请使用: from states import NAME_TO_ID, CLIENT_ID_TO_NAME, NAME_TO_CLIENT_ID, ID_TO_NAME
 
 ALLOWED_CLIENT_ID: list[int] = list(CLIENT_ID_TO_NAME.keys())
 
@@ -201,8 +211,7 @@ class RoboMasterMQTT:
     # 每个 topic 对应状态机中哪些字段需要更新
     # ALL_STATES = 全量更新；列表 = 选择性更新
     UPDATE_ITEMS: Dict[str, Any] = {
-        "GameStatus": ["red_score", "blue_score", "stage_countdown_sec", "stage_elapsed_sec"],
-        **{topic: ALL_STATES for topic in DOWNLINK_TOPICS if topic != "GameStatus"},
+        **{topic: ALL_STATES for topic in DOWNLINK_TOPICS},
     }
 
     def __init__(self, client_id: int, host: str = "192.168.12.1", port: int = 3333):
@@ -236,9 +245,16 @@ class RoboMasterMQTT:
         # 发布锁
         self._publish_lock = threading.Lock()
 
+        # 日志
+        name = CLIENT_ID_TO_NAME.get(client_id, "未知")
+        if name == RED_INFANTRY:
+            name += " No." + str(client_id - 0x0102)
+        elif name == BLUE_INFANTRY:
+            name += " No." + str(client_id - 0x0166)
+
         logger.info(
-            "MQTT[%s: %s] 初始化完成, 连接目标 %s:%s",
-            CLIENT_ID_TO_NAME.get(client_id, client_id), hex(client_id), host, port
+            "MQTT客户端[%s: %s] 初始化完成, 尝试连接目标: %s:%s",
+            name, hex(client_id), host, port
         )
 
     # --------------------------------------------------------
@@ -276,7 +292,7 @@ class RoboMasterMQTT:
 
     def _on_connect(self, _client, _userdata, flags, rc: int) -> None:
         if rc == 0:
-            logger.info("连接成功, 已订阅 %d 个 topic", len(DOWNLINK_TOPICS))
+            logger.info("已订阅 %d 个 topic", len(DOWNLINK_TOPICS))
             for topic in DOWNLINK_TOPICS:
                 self._mqtt.subscribe(topic)
         else:
@@ -337,7 +353,7 @@ class RoboMasterMQTT:
                 # 全量更新：转为嵌套字典 {topic: {...}}
                 msg_dict = MessageToDict(msg, preserving_proto_field_name=True)
                 self.states.update({topic: msg_dict})
-                logger.debug("[%s] 全量更新", topic)
+                logger.debug("[%s] 全量更新: %s", topic, msg_dict)
             elif isinstance(update_spec, list):
                 # 选择性更新：只提取指定字段
                 nested = {}
@@ -383,11 +399,26 @@ class RoboMasterMQTT:
         data = msg.SerializeToString()
         self.publish(topic, data)
 
+# ============================================================
+# 实用函数
+# ============================================================
+def get_client_id(client: str = RED_HERO, idx: int = 0)-> int:
+    """获取客户端ID，默认返回红方英雄的ID."""
+    if client in (RED_INFANTRY, BLUE_INFANTRY):
+        assert idx in (0, 1, 2), f"Invalid {client} index: {idx}"
+        return NAME_TO_CLIENT_ID[client][idx]  # pyright: ignore[reportIndexIssue]
+    return NAME_TO_CLIENT_ID[client]    # pyright: ignore[reportReturnType]
+
 
 # ============================================================
-# 入口
+# 入口（测试）
 # ============================================================
 if __name__ == "__main__":
     # 使用十六进制 CLIENT_ID (0x0101 = 红方英雄)
-    r = RoboMasterMQTT(client_id=NAME_TO_CLIENT_ID["RED_HERO"], host="localhost", port=3333)
+    # logger.debug("debug")
+    # logger.info("info")
+    # logger.warning("warning")
+    # logger.error("error")
+    # logger.critical("critical")
+    r = RoboMasterMQTT(client_id=get_client_id(RED_INFANTRY, 1), host="localhost", port=3333)
     r.start()
