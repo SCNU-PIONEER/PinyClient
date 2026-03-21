@@ -1,528 +1,293 @@
 """
-用于提供mqtt客户端连接的模块
+RoboMaster MQTT 客户端模块
+负责与裁判系统服务器建立 MQTT 连接，接收并解析下行数据。
+状态机逻辑已分离到 states.py，保持解耦。
 """
+from __future__ import annotations
+
 import logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # 设置日志级别为DEBUG以输出调试信息
-logger.debug("日志系统已初始化，日志级别设置为DEBUG")
-stream_handler = logging.StreamHandler()
-stream_handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-stream_handler.setFormatter(formatter)
-logger.addHandler(stream_handler)
-
-
-import paho.mqtt.client as mqtt
+import os
+import time
+import random
 import threading
 import queue
-# from collections import namedtuple
 from dataclasses import dataclass
 from typing import Callable, Dict, Any
-from protobuf_models import DOWN_TOPIC2MODEL_MAP
+
+import paho.mqtt.client as mqtt
 from google.protobuf.json_format import MessageToDict
 
-TOTAL_TIME = 420  # 比赛总时长，单位为秒
-ALL_STATES = "ALL_STATES"
-UNKNOWN = "UNKNOWN"
+from states import RMClientStates, RED, BLUE, ALLY, ALL_STATES, CLIENT_ID_TO_NAME
+from protobuf_models import DOWN_TOPIC2MODEL_MAP, UPLINK_TOPIC2MODEL_MAP
 
-ALLY = "ALLY"
-ENEMY = "ENEMY"
-ALL_SIDES = "ALL_SIDES"
 
-RED = "RED"
-BLUE = "BLUE"
-ALL_COLORS = "ALL_COLORS"
+# ============================================================
+# 彩色日志配置
+# ============================================================
+def _setup_logger(name: str = "pioneer") -> logging.Logger:
+    """
+    配置彩色日志，支持通过 PIONEER_LOG_LEVEL 环境变量切换级别。
+    生产环境设为 INFO，调试时设为 DEBUG。
+    """
+    _COLORS = {
+        "RESET":   "\033[0m",
+        "RED":     "\033[91m",
+        "GREEN":   "\033[92m",
+        "YELLOW":  "\033[93m",
+        "BLUE":    "\033[94m",
+        "MAGENTA": "\033[95m",
+        "CYAN":    "\033[96m",
+        "GRAY":    "\033[90m",
+    }
+    _LEVEL_COLOR = {
+        "DEBUG":   _COLORS["GRAY"],
+        "INFO":    _COLORS["BLUE"],
+        "WARNING": _COLORS["YELLOW"],
+        "ERROR":   _COLORS["RED"],
+        "CRITICAL": _COLORS["MAGENTA"],
+    }
 
-BASE = "BASE"
-OUTPOST = "OUTPOST"
-ALL_BUILDINGS = "ALL_BUILDINGS"
+    logger = logging.getLogger(name)
+    level_str = os.environ.get("PIONEER_LOG_LEVEL", "INFO").upper()
+    logger.setLevel(getattr(logging, level_str, logging.INFO))
+    logger.handlers.clear()
 
-HEALTH = "HEALTH"
-STATUS = "STATUS"
-SHIELD = "SHIELD"
+    class ColorFormatter(logging.Formatter):
+        def format(self, record):
+            color = _LEVEL_COLOR.get(record.levelname, _COLORS["RESET"])
+            record.levelname = f"{color}{record.levelname}{_COLORS['RESET']}"
+            record.name = f"{_COLORS['CYAN']}{record.name}{_COLORS['RESET']}"
+            return super().format(record)
 
-RED_HERO = "RED_HERO"
-RED_ENGINEER = "RED_ENGINEER"
-RED_INFANTRY = "RED_INFANTRY"
-RED_AIR = "RED_AIR"
-RED_SENTRY = "RED_SENTRY"
-RED_DART = "RED_DART"
-RED_RADAR = "RED_RADAR"
-RED_OUTPOST = "RED_OUTPOST"
-RED_BASE = "RED_BASE"
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    fmt = "%(asctime)s | %(levelname)-10s | %(name)s | %(message)s"
+    handler.setFormatter(ColorFormatter(fmt, datefmt="%H:%M:%S"))
+    logger.addHandler(handler)
+    return logger
 
-BLUE_HERO = "BLUE_HERO"
-BLUE_ENGINEER = "BLUE_ENGINEER"
-BLUE_INFANTRY = "BLUE_INFANTRY"
-BLUE_AIR = "BLUE_AIR"
-BLUE_SENTRY = "BLUE_SENTRY"
-BLUE_DART = "BLUE_DART"
-BLUE_RADAR = "BLUE_RADAR"
-BLUE_OUTPOST = "BLUE_OUTPOST"
-BLUE_BASE = "BLUE_BASE"
 
-REFREE_SERVER = "REFREE_SERVER"
+logger = _setup_logger()
 
-NAME_TO_ID = {
-    "RED_HERO": 1,
-    "RED_ENGINEER": 2,
-    "RED_INFANTRY": (3, 4, 5),
-    "RED_AIR": 6,
-    "RED_SENTRY": 7,
-    "RED_DART": 8,
-    "RED_RADAR": 9,
-    "RED_OUTPOST": 10,
-    "RED_BASE": 11,
 
-    "BLUE_HERO": 101,
-    "BLUE_ENGINEER": 102,
-    "BLUE_INFANTRY": (103, 104, 105),
-    "BLUE_AIR": 106,
-    "BLUE_SENTRY": 107,
-    "BLUE_DART": 108,
-    "BLUE_RADAR": 109,
-    "BLUE_OUTPOST": 110,
-    "BLUE_BASE": 111,
+# ============================================================
+# 常量
+# ============================================================
+NAME_TO_ID: Dict[str, Any] = {
+    "RED_HERO": 1, "RED_ENGINEER": 2,
+    "RED_INFANTRY": (3, 4, 5), "RED_AIR": 6,
+    "RED_SENTRY": 7, "RED_DART": 8,
+    "RED_RADAR": 9, "RED_OUTPOST": 10, "RED_BASE": 11,
+    "BLUE_HERO": 101, "BLUE_ENGINEER": 102,
+    "BLUE_INFANTRY": (103, 104, 105), "BLUE_AIR": 106,
+    "BLUE_SENTRY": 107, "BLUE_DART": 108,
+    "BLUE_RADAR": 109, "BLUE_OUTPOST": 110, "BLUE_BASE": 111,
 }
 
-ID_TO_NAME = {}
-for name, ids in NAME_TO_ID.items():
-    if isinstance(ids, tuple):
-        for id in ids:
-            ID_TO_NAME[id] = name
-    else:
-        ID_TO_NAME[ids] = name
+ALLOWED_CLIENT_ID: list[int] = []
+for _ids in NAME_TO_ID.values():
+    ALLOWED_CLIENT_ID.extend(_ids) if isinstance(_ids, tuple) else ALLOWED_CLIENT_ID.append(_ids)
 
-NAME_TO_CLIENT_ID = {
-    RED_HERO: 0x0101,
-    RED_ENGINEER: 0x0102,
-    RED_INFANTRY: (0x0103, 0x0104,0x0105),
-    RED_AIR: 0x0106,
-
-    BLUE_HERO: 0x0165,
-    BLUE_ENGINEER: 0x0166,
-    BLUE_INFANTRY: (0x0167, 0x0168, 0x0169),
-    BLUE_AIR: 0x016A,
-
-    REFREE_SERVER: 0x8080,
+DOWNLINK_TOPICS = {
+    "GameStatus", "GlobalUnitStatus", "GlobalLogisticsStatus",
+    "GlobalSpecialMechanism", "Event", "RobotInjuryStat",
+    "RobotRespawnStatus", "RobotStaticStatus", "RobotDynamicStatus",
+    "RobotModuleStatus", "RobotPosition", "Buff", "PenaltyInfo",
+    "RobotPathPlanInfo", "RadarInfoToClient", "CustomByteBlock",
+    "TechCoreMotionStateSync", "RobotPerformanceSelectionSync",
+    "DeployModeStatusSync", "RuneStatusSync", "SentryStatusSync",
+    "DartSelectTargetStatusSync", "SentryCtrlResult", "AirSupportStatusSync",
 }
-
-CLIENT_ID_TO_NAME = {v: k for k, v in NAME_TO_CLIENT_ID.items()}
-
-ALLOWED_CLIENT_ID = []
-for _, ids in NAME_TO_CLIENT_ID.items():
-    if isinstance(ids, tuple):
-        ALLOWED_CLIENT_ID.extend(ids)
-    else:
-        ALLOWED_CLIENT_ID.append(ids)
 
 UPLINK_TOPICS = {
-    "CommonCommand",
-    "RobotPerformanceSelectionCommand",
-    "HeroDeployModeEventCommand",
-    "RuneActivateCommand",
-    "DartCommand",
-    "MapSentryPathSearchCommand",
-    "SentryPathControlCommand",
-    "MapRadarMarkCommand",
-    "AirsupportCommand",
+    "CommonCommand", "RobotPerformanceSelectionCommand",
+    "HeroDeployModeEventCommand", "RuneActivateCommand", "DartCommand",
+    "MapSentryPathSearchCommand", "SentryPathControlCommand",
+    "MapRadarMarkCommand", "AirsupportCommand",
     "TechCoreAssembleOperationCommand",
 }
-DOWNLINK_TOPICS = {
-    "GameStatus",
-    "GlobalUnitStatus",
-    "GlobalLogisticsStatus",
-    "GlobalSpecialMechanism",
-    "Event",
-    "RobotInjuryStat",
-    "RobotRespawnStatus",
-    "RobotStaticStatus",
-    "RobotDynamicStatus",
-    "RobotModuleStatus",
-    "RobotPosition",
-    "Buff",
-    "PenaltyInfo",
-    "RobotPathPlanInfo",
-    "RaderInfoToClient",
-    "CustomByteBlock",
-    "TechCoreMotionStateSync",
-    "RobotPerformanceSelectionSync",
-    "DeployModeStatusSync",
-    "RuneStatusSync",
-    "SentryStatusSync",
-    "DartSelectTargetStatusSync",
-    "SentryCtrlResult",
-    "AirSupportStatusSync",
-}
-    
 
-# DataClass Structures
-# Time
-@dataclass
-class RMTime:
-    remaining_time: int
-    passed_time: int
-    total_time: int
-
-    def __str__(self):
-        return f"{self.remaining_time} - {self.total_time}"
-
-# Building status(including ENEMY/ALLY, BASE/OUTPOST)
-@dataclass
-class RMBuildingStatus:
-    health: int
-    status: int
-    shield: int
-
-@dataclass
-class RMSideBuildingStatus:
-    BASE: RMBuildingStatus
-    OUTPOST: RMBuildingStatus
-
-@dataclass
-class RMAllBuildingsStatus:
-    RED: RMSideBuildingStatus
-    BLUE: RMSideBuildingStatus
-
-
+# ============================================================
+# 主类
+# ============================================================
 class RoboMasterMQTT:
+    """
+    MQTT 客户端，连接裁判系统服务器，接收比赛数据并更新状态机。
+    """
+
+    # 每个 topic 对应状态机中哪些字段需要更新
+    # ALL_STATES = 全量更新；列表 = 选择性更新
+    UPDATE_ITEMS: Dict[str, Any] = {
+        "GameStatus": ["red_score", "blue_score", "stage_countdown_sec", "stage_elapsed_sec"],
+        **{topic: ALL_STATES for topic in DOWNLINK_TOPICS if topic != "GameStatus"},
+    }
 
     def __init__(self, client_id: int, host: str = "192.168.12.1", port: int = 3333):
         if client_id not in ALLOWED_CLIENT_ID:
-            logger.critical(f"Invalid client_id: {client_id}. Allowed client_ids are: {ALLOWED_CLIENT_ID}")
-            raise ValueError(f"Invalid client_id: {client_id}. Please choose from {ALLOWED_CLIENT_ID}.")
-        # 初始化MQTT客户端
-        self.client_id = client_id  # 机器人ID：1=红方英雄, 8=红方飞镖, 108=蓝方飞镖等
+            logger.critical("无效的 client_id: %s，允许值: %s", client_id, ALLOWED_CLIENT_ID)
+            raise ValueError(f"Invalid client_id: {client_id}")
+
+        self.client_id = client_id
         self.host = host
         self.port = port
-        self.client = mqtt.Client(client_id=str(client_id))
-        self.message_queue = queue.Queue()
-        self.callbacks: Dict[str, Callable] = {}
-        # 初始化状态机
-        self.states = RMClientStates()
-        self.states.set_ally_color(RED if NAME_TO_CLIENT_ID[RED_HERO] <= client_id < NAME_TO_CLIENT_ID[RED_AIR] else BLUE)
-        # 定义需要更新状态的topic和对应的状态字段列表
-        self.update_items = {
-            "GameStatus": ["red_score", "blue_score", "stage_countdown_sec", "stage_elapsed_sec"],
-            "GlobalUnitStatus": ALL_STATES,
 
-        }
-        # 设置回调
-        self.client.on_connect = self._on_connect
-        self.client.on_message = self._on_message
-        self.client.on_disconnect = self._on_disconnect
-        logger.info(f"MQTT[{CLIENT_ID_TO_NAME[client_id]}] 服务端 连接到了: {host}:{port}")
-    
-    def _on_connect(self, client, userdata, flags, rc):
-        """
-        - client: MQTT客户端实例
-        - userdata: 用户数据，连接时传入的参数
-        - flags: 连接结果标志
-        - rc: 连接结果代码, 0表示成功
-        """
+        # 状态机（独立类，可单独提取给 HTTP 模块使用）
+        ally_color = RED if client_id < 100 else BLUE
+        self.states = RMClientStates(ally_color=ally_color)
+
+        # MQTT 客户端
+        self._mqtt = mqtt.Client(client_id=str(client_id))
+        self._mqtt.on_connect    = self._on_connect
+        self._mqtt.on_message   = self._on_message
+        self._mqtt.on_disconnect = self._on_disconnect
+
+        # 消息队列（有界，满了丢弃最旧消息）
+        self._queue: queue.Queue[tuple[str, bytes]] = queue.Queue(maxsize=500)
+
+        # 回调表
+        self._callbacks: Dict[str, Callable[[bytes], None]] = {}
+
+        # 发布锁
+        self._publish_lock = threading.Lock()
+
+        logger.info(
+            "MQTT[%s] 初始化完成，连接目标 %s:%s",
+            CLIENT_ID_TO_NAME.get(client_id, client_id), host, port
+        )
+
+    # --------------------------------------------------------
+    # MQTT 生命周期
+    # --------------------------------------------------------
+    def start(self) -> None:
+        """启动 MQTT 客户端（连接 + 消息处理线程）。"""
+        self._register_callbacks()
+        self._connect_loop()
+        threading.Thread(target=self._process_messages, name="msg_processor", daemon=True).start()
+        logger.info("MQTT 客户端已启动")
+
+    def stop(self) -> None:
+        """断开连接并停止线程。"""
+        self._mqtt.loop_stop()
+        self._mqtt.disconnect()
+        logger.info("MQTT 客户端已停止")
+
+    def _connect_loop(self) -> None:
+        """指数退避重连。"""
+        max_delay = 30
+        delay = 1.0
+        attempt = 0
+        while True:
+            try:
+                self._mqtt.connect(self.host, self.port, keepalive=60)
+                self._mqtt.loop_start()
+                logger.info("已连接到 %s:%s", self.host, self.port)
+                return
+            except Exception as e:
+                attempt += 1
+                logger.warning("第 %d 次连接失败: %s，%.1fs 后重试...", attempt, e, delay)
+                time.sleep(delay)
+                delay = min(delay * 1.5 + random.uniform(0, 0.5), max_delay)
+
+    def _on_connect(self, _client, _userdata, flags, rc: int) -> None:
         if rc == 0:
-            logger.info(f"连接成功: {CLIENT_ID_TO_NAME[self.client_id]} - {self.client_id} 已连接到 MQTT 服务器")
-            # 连接成功后订阅必要topic
+            logger.info("连接成功，已订阅 %d 个 topic", len(DOWNLINK_TOPICS))
             for topic in DOWNLINK_TOPICS:
-                self.client.subscribe(topic)
+                self._mqtt.subscribe(topic)
         else:
-            logger.error(f"连接失败，错误代码: {rc}")
-            
-    def _on_message(self, client, userdata, msg):
-        # 将消息放入队列，由处理线程解析
-        logger.debug(f"收到了消息: {msg.topic}")
-        self.message_queue.put((msg.topic, msg.payload))
-        
-    def _on_disconnect(self, client, userdata, rc):
-        logger.warning(f"连接断开, rc={rc}, 正在尝试重连...")
-        # 当
-        while(True):
-            try:
-                self.client.connect(self.host, self.port, 60)
-                logger.info("重连成功")
-                # self.client.loop_start()
-                break
-            except Exception as e:
-                logger.error(f"重连失败: {e}正在重试连接MQTT服务器...")        
+            logger.error("连接失败，rc=%d", rc)
 
-    def _start_mqtt(self):
-        logger.info("正在尝试启动MQTT客户端...")
-        while(True):
-            try:
-                self.client.connect(self.host, self.port, 60)
-                logger.info("连接MQTT服务器成功")
-                break
-            except Exception as e:
-                logger.error(f"连接MQTT服务器失败: {e}正在重试连接MQTT服务器...")
-        
-        self.client.loop_start()
+    def _on_message(self, _client, _userdata, msg) -> None:
+        try:
+            self._queue.put_nowait((msg.topic, msg.payload))
+        except queue.Full:
+            logger.warning("消息队列已满，丢弃 topic=%s", msg.topic)
 
-    def _start_message_processing(self):
-        # 启动消息处理线程
-        threading.Thread(target=self._process_messages, daemon=True).start()
+    def _on_disconnect(self, _client, _userdata, rc: int) -> None:
+        logger.warning("连接断开 (rc=%d)，正在重连...", rc)
+        self._connect_loop()
 
-    def start(self):
-        self.register_callbacks()
-        self._start_mqtt()
-        self._start_message_processing()
-    # ==============信息接收================
-    def _process_messages(self):
-        """消息处理循环"""
+    # --------------------------------------------------------
+    # 消息处理
+    # --------------------------------------------------------
+    def _process_messages(self) -> None:
+        """消息处理循环：从队列取消息 → 解析 → 更新状态机。"""
         logger.info("消息处理线程已启动")
         while True:
-            topic, payload = self.message_queue.get()
-            logger.debug(f"从队列中获取消息: {topic} - {payload}")
-            if topic in self.callbacks:
-                logger.debug(f"消息处理线程开始处理消息: {topic} - {payload}")
-                self.callbacks[topic](payload)
-                
-    def state_update(self, state, msgs:Any = None):
-        # 根据主题对应的消息内容更新状态，并记录日志
-        # state: 传入的状态标识，msgs: 解析后的消息对象
-        if isinstance(state, str):
-            if state == ALL_STATES:
-                msg_dict = MessageToDict(msgs, preserving_proto_field_name=True)
-                self.states.updates.update(msg_dict)
-                logger.info(f"状态机全部更新: {msg_dict}")
+            topic, payload = self._queue.get()
+            if topic in self._callbacks:
+                try:
+                    self._callbacks[topic](payload)
+                except Exception as e:
+                    logger.error("处理 %s 时出错: %s", topic, e)
+
+    def _register_callbacks(self) -> None:
+        """
+        批量注册所有 topic 的回调。
+        所有 topic 共用同一个解析函数，保持代码简洁；
+        特殊逻辑可在各自回调中添加。
+        """
+        def parse_and_update(topic: str, payload: bytes) -> None:
+            """解析 Protobuf 消息并更新状态机。"""
+            model_cls = DOWN_TOPIC2MODEL_MAP.get(topic)
+            if model_cls is None:
+                logger.warning("未找到 topic '%s' 的 Protobuf 模型，跳过", topic)
+                return
+
+            msg = model_cls()
+            try:
+                msg.ParseFromString(payload)
+            except Exception as e:
+                logger.error("解析 %s 失败: %s", topic, e)
+                return
+
+            # 按配置更新状态机
+            update_spec = self.UPDATE_ITEMS.get(topic, ALL_STATES)
+            if update_spec == ALL_STATES:
+                msg_dict = MessageToDict(msg, preserving_proto_field_name=True)
+                self.states.update(msg_dict)
+                logger.debug("[%s] 全量更新: %s", topic, msg_dict)
+            elif isinstance(update_spec, list):
+                for field in update_spec:
+                    val = getattr(msg, field, None)
+                    self.states.update({field: val})
+                logger.debug("[%s] 选择更新: %s", topic, update_spec)
+
+        for topic in DOWNLINK_TOPICS:
+            self._callbacks[topic] = lambda payload, t=topic: parse_and_update(t, payload)
+        logger.debug("已注册 %d 个 topic 回调", len(self._callbacks))
+
+    # --------------------------------------------------------
+    # 状态查询（委托给状态机）
+    # --------------------------------------------------------
+    def state_update(self, state, msgs: Any = None) -> None:
+        """兼容旧 API，内部转发给状态机。"""
+        if state == ALL_STATES and msgs is not None:
+            self.states.update(MessageToDict(msgs, preserving_proto_field_name=True))
+
+    # --------------------------------------------------------
+    # 发送指令
+    # --------------------------------------------------------
+    def publish(self, topic: str, message: bytes) -> None:
+        """发送上行指令到裁判系统服务器。"""
+        with self._publish_lock:
+            result = self._mqtt.publish(topic, message)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                logger.error("发布 %s 失败，rc=%d", topic, result.rc)
             else:
-                val: Any = getattr(msgs, state, "未知分数")  
-                self.states.updates[state] = val  
-                logger.info(f"状态机更新: {state} = {val}")
-        else:
-            # 处理列表
-            assert isinstance(state, list), "状态标识必须是字符串或字符串列表"
-            for s in state:
-                val: Any = getattr(msgs, s, "未知分数")  
-                self.states.updates[s] = val  
-                logger.info(f"状态机批量更新: {s} = {val}")
+                logger.debug("已发布 %s", topic)
 
-    def register_callbacks(self):
-        def register(topic: str):
-            # 装饰器工厂，用于注册回调函数并记录日志
-            def wrapper(func: Callable[[RoboMasterMQTT, bytes], None]):
-                # func: 需要注册的回调函数，必须接受(self, payload)两个参数
-                logger.debug(f"注册回调函数: {func.__name__} 用于处理 topic: {topic}")
-                self.callbacks[topic] = func.__get__(self)  # 将函数绑定到实例上，使其成为实例方法
-                return func
-            return wrapper
-
-        def parse_AND_update(topic: str, payload: bytes):
-            """
-            解析消息并更新状态的通用函数, 适用于所有topic
-             - topic: 消息主题
-             - payload: 消息负载
-             - return: 解析后的消息对象
-            """
-            logger.info(f"收到并开始处理 {topic} 消息")
-            # 解析消息并记录解析结果
-            parsed_msg = DOWN_TOPIC2MODEL_MAP[topic]()
-            parsed_msg.ParseFromString(payload)
-
-            # 遍历person.DESCRIPTOR.fields获取字段信息，并记录日志
-            # 是否可以用MessageToDict直接转换成字典并记录日志？如果字段较多，手动遍历可能更清晰
-            # msg_dict = MessageToDict(parsed_msg, preserving_proto_field_name=True)
-            # logger.debug(f"{topic} 解析结果: {msg_dict}")
-            field_info = []
-            for field in parsed_msg.DESCRIPTOR.fields:
-                value = getattr(parsed_msg, field.name)
-                field_info.append(f"{field.name}={value}")
-            logger.debug(f"{topic} 解析结果: {', '.join(field_info)}")
-
-            # 根据update_items中的配置更新状态机，并记录更新结果
-            self.state_update(self.update_items[topic], parsed_msg)
-            return parsed_msg
-
-        # 批量注册，定义回调函数（严格保持模板结构，便于后续扩展功能）
-        @register("GameStatus")
-        def process_game_status(self, payload: bytes):
-            parse_AND_update("GameStatus", payload)
-
-        @register("GlobalUnitStatus")
-        def process_global_unit_status(self, payload: bytes):
-            parse_AND_update("GlobalUnitStatus", payload)
-
-        @register("GlobalLogisticsStatus")
-        def process_global_logistics_status(self, payload: bytes):
-            parse_AND_update("GlobalLogisticsStatus", payload)
-
-        @register("GlobalSpecialMechanism")
-        def process_global_special_mechanism(self, payload: bytes):
-            parse_AND_update("GlobalSpecialMechanism", payload)
-
-        @register("Event")
-        def process_event(self, payload: bytes):
-            parse_AND_update("Event", payload)
-
-        @register("RobotInjuryStat")
-        def process_robot_injury_stat(self, payload: bytes):
-            parse_AND_update("RobotInjuryStat", payload)
-
-        @register("RobotRespawnStatus")
-        def process_robot_respawn_status(self, payload: bytes):
-            parse_AND_update("RobotRespawnStatus", payload)
-
-        @register("RobotStaticStatus")
-        def process_robot_static_status(self, payload: bytes):
-            parse_AND_update("RobotStaticStatus", payload)
-
-        @register("RobotDynamicStatus")
-        def process_robot_dynamic_status(self, payload: bytes):
-            parse_AND_update("RobotDynamicStatus", payload)
-
-        @register("RobotModuleStatus")
-        def process_robot_module_status(self, payload: bytes):
-            parse_AND_update("RobotModuleStatus", payload)
-
-        @register("RobotPosition")
-        def process_robot_position(self, payload: bytes):
-            parse_AND_update("RobotPosition", payload)
-
-        @register("Buff")
-        def process_buff(self, payload: bytes):
-            parse_AND_update("Buff", payload)
-
-        @register("PenaltyInfo")
-        def process_penalty_info(self, payload: bytes):
-            parse_AND_update("PenaltyInfo", payload)
-
-        @register("RobotPathPlanInfo")
-        def process_robot_path_plan_info(self, payload: bytes):
-            parse_AND_update("RobotPathPlanInfo", payload)
-
-        @register("RadarInfoToClient")
-        def process_radar_info_to_client(self, payload: bytes):
-            parse_AND_update("RadarInfoToClient", payload)
-
-        @register("CustomByteBlock")
-        def process_custom_byte_block(self, payload: bytes):
-            parse_AND_update("CustomByteBlock", payload)
-
-        @register("TechCoreMotionStateSync")
-        def process_tech_core_motion_state_sync(self, payload: bytes):
-            parse_AND_update("TechCoreMotionStateSync", payload)
-
-        @register("RobotPerformanceSelectionSync")
-        def process_robot_performance_selection_sync(self, payload: bytes):
-            parse_AND_update("RobotPerformanceSelectionSync", payload)
-
-        @register("DeployModeStatusSync")
-        def process_deploy_mode_status_sync(self, payload: bytes):
-            parse_AND_update("DeployModeStatusSync", payload)
-
-        @register("RuneStatusSync")
-        def process_rune_status_sync(self, payload: bytes):
-            parse_AND_update("RuneStatusSync", payload)
-
-        @register("SentryStatusSync")
-        def process_sentry_status_sync(self, payload: bytes):
-            parse_AND_update("SentryStatusSync", payload)
-
-        @register("DartSelectTargetStatusSync")
-        def process_dart_select_target_status_sync(self, payload: bytes):
-            parse_AND_update("DartSelectTargetStatusSync", payload)
-
-        @register("SentryCtrlResult")
-        def process_sentry_ctrl_result(self, payload: bytes):
-            parse_AND_update("SentryCtrlResult", payload)
-
-        @register("AirSupportStatusSync")
-        def process_air_support_status_sync(self, payload: bytes):
-            parse_AND_update("AirSupportStatusSync", payload)
-    # ==============信息发送================
-    def publish(self, topic: str, message: bytes):
-        logger.debug(f"发布消息: {topic} - {message}")
-        self.client.publish(topic, message)
+    def publish_command(self, topic: str, msg) -> None:
+        """序列化 Protobuf 消息并发送（便捷封装）。"""
+        if topic not in UPLINK_TOPIC2MODEL_MAP:
+            logger.warning("未知上行 topic: %s", topic)
+            return
+        data = msg.SerializeToString()
+        self.publish(topic, data)
 
 
-class RMClientStates:
-
-    def __init__(self) -> None:
-        self.updates = {
-            # GameStatus
-            "red_score": 0,
-            "blue_score": 0,
-            "stage_countdown_sec": 0,
-            "stage_elapsed_sec": 0,
-            # GlobalUnitStatus
-            # ally
-            "base_health": 0,
-            "base_status": 0,
-            "base_shield": 0,
-            "outpost_health": 0,
-            "outpost_status": 0,
-            # enemy
-            "enemy_base_health": 0,
-            "enemy_base_status": 0,
-            "enemy_base_shield": 0,
-            "enemy_outpost_health": 0,
-            "enemy_outpost_status": 0,
-            # 其他状态字段...
-        }  
-        self.side2color = {
-            ALLY: UNKNOWN,
-            ENEMY: UNKNOWN,
-        }
-        self.color2side = {
-            RED: UNKNOWN,
-            BLUE: UNKNOWN,
-        }
-
-    def set_ally_color(self, color: str):
-        # 若color为RED，则ALLY对应RED，ENEMY对应BLUE；反之亦然
-        if color == RED:
-            self.side2color[ALLY] = RED
-            self.side2color[ENEMY] = BLUE
-            self.color2side[RED] = ALLY
-            self.color2side[BLUE] = ENEMY
-        elif color == BLUE:
-            self.side2color[ALLY] = BLUE
-            self.side2color[ENEMY] = RED
-            self.color2side[BLUE] = ALLY
-            self.color2side[RED] = ENEMY
-        else:
-            raise ValueError("Invalid color. Please specify 'RED' or 'BLUE'.")
-
-    def get_time(self):
-        """
-        返回(剩余时间，已用时间，总时间)，单位为秒
-         - 剩余时间 = stage_countdown_sec
-         - 已用时间 = stage_elapsed_sec
-         - 总时间 = TOTAL_TIME
-        """
-        return RMTime(
-            remaining_time=self.updates.get("stage_countdown_sec", 0),
-            passed_time=self.updates.get("stage_elapsed_sec", 0),
-            total_time=TOTAL_TIME
-        )
-
-    def get_building_status(self, side: str = ALL_SIDES, building_type: str = ALL_BUILDINGS):
-        """
-        返回建筑状态，包括基地和前哨站的血量、状态和护盾
-        """
-        building_status = RMAllBuildingsStatus(
-            RED=RMSideBuildingStatus(
-                BASE=RMBuildingStatus(health=self.updates["base_health"], status=self.updates["base_status"], shield=self.updates["base_shield"]),
-                OUTPOST=RMBuildingStatus(health=self.updates["outpost_health"], status=self.updates["outpost_status"], shield=0)
-            ),
-            BLUE=RMSideBuildingStatus(
-                BASE=RMBuildingStatus(health=self.updates["base_health"], status=self.updates["base_status"], shield=self.updates["base_shield"]),
-                OUTPOST=RMBuildingStatus(health=self.updates["outpost_health"], status=self.updates["outpost_status"], shield=0)
-            )
-        )
-        if side == ALL_SIDES:
-            assert building_type == ALL_BUILDINGS, "当side为ALL_SIDES时, building_type必须为ALL_BUILDINGS"
-            return building_status
-        else:
-            assert side in (RED, BLUE), "Invalid side. Please specify 'RED', 'BLUE' or 'ALL_SIDES'."
-            if building_type == ALL_BUILDINGS:
-                return getattr(building_status, side)
-            else:
-                assert building_type in (BASE, OUTPOST), "Invalid building_type. Please specify 'BASE', 'OUTPOST' or 'ALL_BUILDINGS'."
-                return getattr(getattr(building_status, side), building_type)
-    
-
+# ============================================================
+# 入口
+# ============================================================
 if __name__ == "__main__":
-    r = RoboMasterMQTT(client_id=NAME_TO_CLIENT_ID[RED_HERO], host="localhost", port=3333)
+    r = RoboMasterMQTT(client_id=NAME_TO_ID["RED_HERO"], host="localhost", port=3333)
     r.start()
-    test_proto = DOWN_TOPIC2MODEL_MAP["GameStatus"]()
-
