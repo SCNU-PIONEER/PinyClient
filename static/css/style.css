@@ -1,0 +1,74 @@
+html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background: linear-gradient(120deg, #84fab0 0%, #8fd3f4 100%);
+    padding: 20px;
+    box-sizing: border-box;
+}
+
+.dashboard {
+    display: grid;
+    grid-template-columns: 7fr 3fr;
+    grid-template-rows: 7fr 3fr;
+    gap: 15px;
+    height: 100%;
+    width: 100%;
+}
+
+.left-top, .right-top, .left-bottom, .right-bottom {
+    border-radius: 10px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.left-top {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.right-top {
+    background: linear-gradient(135deg, #ff9a9e 0%, #fad0c4 100%);
+}
+
+.left-bottom {
+    background: linear-gradient(135deg, #f6d365 0%, #fda085 100%);
+}
+
+.right-bottom {
+    background: linear-gradient(135deg, #a1c4fd 0%, #c2e9fb 100%);
+}
+
+.video-block {
+    /* 视频容器 - 控制实际显示区域 */
+    width: 90%;      /* 相对于left-top的宽度 */
+    height: 90%;     /* 相对于left-top的高度 */
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 8px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+    
+    /* 可选：添加边框或内阴影 */
+    /* border: 2px solid rgba(255,255,255,0.3); */
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.video-stream {
+    /* max-width: 100%;
+    max-height: 100%; */
+    width: auto;
+    height: 100%;
+    /* display: inline-block;
+    text-align: center; */
+    border-radius: 10px;
+    display: block;
+    /* margin: 0 auto; */
+    /* display: flex;
+    justify-content: center;
+    align-items: center; */
+}

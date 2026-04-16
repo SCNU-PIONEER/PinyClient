@@ -1,10 +1,6 @@
-old
-backend/PIONEER-client.code-workspace
-backend/PIONEER-client/.vscode
-unit-test
-__pycache__
+oth-old_structures/
+__pycache__/
 *.pyc
 fix.md
-Docs
-codebuddylog
-.vscode
+.vscode/
+test_videos/

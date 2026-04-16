@@ -1,5 +1,0 @@
-paho-mqtt
-protobuf
-fastapi
-websockets
-ffmpeg-python
