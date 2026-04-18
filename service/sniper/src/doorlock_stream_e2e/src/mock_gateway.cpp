@@ -20,8 +20,13 @@ std::atomic<bool> g_stop{false};
 
 constexpr int kUdpListenPort = 12345;
 constexpr size_t kPacketSize = 300;
-constexpr const char * kMqttServer = "tcp://127.0.0.1:3333";
-constexpr const char * kMqttClientId = "mock_gateway_cpp";
+// [官方环境约束]
+// Broker 固定为 192.168.12.1:3333（RoboMaster 2026 协议文档）。
+constexpr const char * kMqttServer = "tcp://192.168.12.1:3333";
+// [身份约束]
+// client_id 必须使用官方允许的选手端编号字符串（如红方英雄 0x0101 的十进制字符串 1）。
+// 当前值用于联调，请按赛场分配规则替换，避免与在线客户端身份冲突。
+constexpr const char * kMqttClientId = "1";
 constexpr const char * kMqttTopic = "CustomByteBlock";
 constexpr int kMqttQos = 0;
 
