@@ -371,6 +371,9 @@ class NormalImgSource(ImgSource):
         super().__init__()
         self._bind_host = host
         self._bind_port = port
+        self.decode_thread: Optional[threading.Thread] = None
+        self.packet_queue: Queue[bytes] = Queue(maxsize=RTP_QUEUE_MAXSIZE)
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -382,6 +385,127 @@ class NormalImgSource(ImgSource):
             )
         self.sock.settimeout(1.0)
         logger.info(f"UDP接收器已绑定到 {self.sock.getsockname()}")
+
+        self.pipeline = Gst.parse_launch(
+            "appsrc name=hevc_source is-live=true format=time do-timestamp=false "
+            "caps=\"video/x-h265,stream-format=byte-stream,alignment=au\" ! "
+            "h265parse ! avdec_h265 ! videoconvert ! video/x-raw,format=BGR ! "
+            "appsink name=hevc_sink sync=false max-buffers=5 drop=true emit-signals=true"
+        )
+        self.appsrc = self.pipeline.get_by_name("hevc_source")
+        self.appsink = self.pipeline.get_by_name("hevc_sink")
+        if self.appsrc is None or self.appsink is None:
+            raise RuntimeError("GStreamer HEVC pipeline 初始化失败：无法获取 appsrc/appsink")
+
+        self.appsrc.set_property("block", False)
+        self.appsink.connect("new-sample", self._on_hevc_new_sample)
+        self.bus = self.pipeline.get_bus()
+
+    def _drain_packet_queue(self):
+        while True:
+            try:
+                _ = self.packet_queue.get_nowait()
+            except Empty:
+                break
+
+    def _try_assemble_frame(self):
+        if self.cur_length == self.total_length and self.total_length > 0:
+            frame_data = b''.join(self.frame_buffer[i] for i in sorted(self.frame_buffer.keys()))
+
+            try:
+                self.packet_queue.put_nowait(frame_data)
+            except Full:
+                try:
+                    _ = self.packet_queue.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    self.packet_queue.put_nowait(frame_data)
+                except Full:
+                    pass
+
+            self._init_frame(-1, 0)
+            return None
+
+        return None
+
+    def _push_hevc_data(self, hevc_data: bytes) -> bool:
+        if not hevc_data:
+            return False
+
+        buf = Gst.Buffer.new_allocate(None, len(hevc_data), None)
+        buf.fill(0, hevc_data)
+        ret = self.appsrc.emit("push-buffer", buf)
+        if ret != Gst.FlowReturn.OK:
+            logger.debug(f"HEVC推送失败: {ret}")
+            return False
+        return True
+
+    def _on_hevc_new_sample(self, sink):
+        try:
+            sample = sink.emit("pull-sample")
+            if sample is None:
+                return Gst.FlowReturn.OK
+
+            buf = sample.get_buffer()
+            caps = sample.get_caps()
+            if buf is None or caps is None:
+                return Gst.FlowReturn.OK
+
+            caps_struct = caps.get_structure(0)
+            width = caps_struct.get_value("width")
+            height = caps_struct.get_value("height")
+            if not isinstance(width, int) or not isinstance(height, int):
+                return Gst.FlowReturn.OK
+
+            ok, map_info = buf.map(Gst.MapFlags.READ)
+            if not ok:
+                return Gst.FlowReturn.OK
+
+            frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape((height, width, 3)).copy()
+            buf.unmap(map_info)
+
+            with self.frame_lock:
+                self.latest_frame = frame
+
+            if self.cv_debug:
+                cv2.imshow("UDP HEVC Stream", frame)
+                cv2.waitKey(1)
+        except Exception as e:
+            logger.debug(f"HEVC new-sample 处理异常: {e}")
+
+        return Gst.FlowReturn.OK
+
+    def _poll_bus(self):
+        while True:
+            msg = self.bus.pop_filtered(
+                Gst.MessageType.ERROR | Gst.MessageType.WARNING | Gst.MessageType.EOS
+            )
+            if msg is None:
+                break
+
+            if msg.type == Gst.MessageType.ERROR:
+                err, dbg = msg.parse_error()
+                logger.error(f"UDP HEVC解码器错误: {err}, debug={dbg}")
+            elif msg.type == Gst.MessageType.WARNING:
+                warn, dbg = msg.parse_warning()
+                logger.warning(f"UDP HEVC解码器警告: {warn}, debug={dbg}")
+            elif msg.type == Gst.MessageType.EOS:
+                logger.warning("UDP HEVC解码器收到EOS")
+
+    def _decode_loop(self):
+        while self.running:
+            self._poll_bus()
+
+            try:
+                hevc_data = self.packet_queue.get(timeout=0.05)
+                self._push_hevc_data(hevc_data)
+            except Empty:
+                pass
+            except Exception as e:
+                logger.error(f"HEVC 推流异常: {e}")
+
+            time.sleep(0.001)
 
     def _receive_loop(self):
         logger.info(f"3334 UDP接收循环已启动，监听{self.sock.getsockname()}，等待数据包...")
@@ -395,6 +519,8 @@ class NormalImgSource(ImgSource):
 
                 frame_id, chunk_id, total_length = NormalUDPPackage(data=data).parse()[:3]
                 chunk_data = data[UDP_HEADER_SIZE:]
+                # [RM 2026 协议适配] 严格遵循官方文档：UDP 3334 端口前 8 字节为自定义分片头，后续才是 HEVC 裸流。
+                # 必须剥离 8 字节头后再喂给 GStreamer 的 appsrc，否则 h265parse 会因找不到 NALU 起始码而黑屏。
 
                 self._check_timeout()
 
@@ -407,10 +533,7 @@ class NormalImgSource(ImgSource):
                     self._init_frame(frame_id, total_length)
 
                 self._update_frame(chunk_id, chunk_data)
-                complete_frame = self._try_assemble_frame()
-                if complete_frame is not None and self.cv_debug:
-                    cv2.imshow("UDP Stream", complete_frame)
-                    cv2.waitKey(1)
+                self._try_assemble_frame()
             except socket.timeout:
                 self._check_timeout()
                 continue
@@ -429,18 +552,28 @@ class NormalImgSource(ImgSource):
                 f"UDP套接字绑定异常，期望端口 {self._bind_port}，实际 {bound_host}:{bound_port}"
             )
 
+        self._drain_packet_queue()
+        self.pipeline.set_state(Gst.State.PLAYING)
         self.running = True
         self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
+        self.decode_thread = threading.Thread(target=self._decode_loop, daemon=True)
         self.receive_thread.start()
-        logger.info("UDP服务器线程已启动")
+        self.decode_thread.start()
+        logger.info("UDP服务器线程与HEVC解码线程已启动")
 
     def stop(self):
         if not self.running:
             logger.warning("UDP服务器已经停止")
             return
         self.running = False
+
         if self.receive_thread is not None:
             self.receive_thread.join(timeout=5.0)
+        if self.decode_thread is not None:
+            self.decode_thread.join(timeout=5.0)
+
+        self.appsrc.emit("end-of-stream")
+        self.pipeline.set_state(Gst.State.NULL)
         self.sock.close()
         logger.info("UDP服务器线程已停止")
 

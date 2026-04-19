@@ -14,17 +14,24 @@ from tools.rm_logger import RMColorLogger
 logger = RMColorLogger("CoreService")
 
 class CoreService:
-    def __init__(self, side: consts.Sides, robot:consts.RobotTypes, infantry_select: int = 0, host: str = "127.0.0.1", port_udp: int = 3334, port_mqtt: int = 3333,
+    def __init__(self, side: consts.Sides, robot:consts.RobotTypes, infantry_select: int = 0, host: str = "127.0.0.1", mqtt_host: str | None = None, udp_bind_host: str | None = None, port_udp: int = 3334, port_mqtt: int = 3333,
                  subscribe_topics: set[str] = consts.DOWNLINK_TOPICS, publish_topics: set[str] = consts.UPLINK_TOPICS
                  ):
         # self.host = host
         # self.port_udp = port_udp
         # self.port_mqtt = port_mqtt
         self.player_type = consts.PlayerTypes(Side=side, Robot=robot, Infantry_Select=infantry_select)
+        # [架构约束]
+        # MQTT 连接地址与 UDP 监听地址必须分离：
+        # - mqtt_target_host: 远端 Broker 地址
+        # - udp_target_host: 本机 bind 地址
+        # 兼容旧参数：未显式传入时沿用 host。
+        mqtt_target_host = mqtt_host or host
+        udp_target_host = udp_bind_host or host
         # MQTT 客户端配置(订阅和发布，其中发布不需要传入订阅的主题与处理函数)
-        self.core_mqtt = RMMQTTClient(cli_id=str(self.player_type.get_cli_id()), host=host, port=port_mqtt, subscribe_topics=subscribe_topics, handler=TOPIC2MSG, callback=self.update_state, description="core client")
+        self.core_mqtt = RMMQTTClient(cli_id=str(self.player_type.get_cli_id()), host=mqtt_target_host, port=port_mqtt, subscribe_topics=subscribe_topics, handler=TOPIC2MSG, callback=self.update_state, description="core client")
         # 图传数据源配置
-        self.normal_source = NormalImgSource(host=host, port=port_udp)
+        self.normal_source = NormalImgSource(host=udp_target_host, port=port_udp)
         self.mqtt_source = MqttImgSource(mqtt=self.core_mqtt)  # 将MQTT客户端实例传入图传数据源，使其能够直接从MQTT消息中获取图像数据
         self._stop_event = threading.Event()
         self._mode_monitor_thread: threading.Thread | None = None
@@ -54,26 +61,17 @@ class CoreService:
         self.core_mqtt.update(data)  # 将消息对象转换为字典并更新状态
 
     def _mode_monitor_loop(self):
-        """根据 DeployModeStatusSync 动态切换图传数据源。"""
-        # is_hero_old = False
-        first_check = False
+        """官方链路下图传固定走 UDP，MQTT 仅用于状态/自定义数据。"""
         while not self._stop_event.is_set():
-            # logger.info(self.core_mqtt.state_manager.get("DeployModeStatusSync", "status"))  # 输出当前状态以便调试
-            is_hero = self.core_mqtt.state_manager.get("DeployModeStatusSync", "status") == 1
-            if is_hero != self.is_hero_old or not first_check:
-                if is_hero:
-                    logger.info("检测到吊射模式，启用MQTT图传数据源")
-                    self.mqtt_source.start()
-                    self.normal_source.stop()  # 确保另一个数据源停止
-                    
-                else:
-                    logger.info("未检测到吊射模式，启用UDP图传数据源")
-                    self.normal_source.start()
-                    self.mqtt_source.stop()  # 确保另一个数据源停止
-                self.is_hero_old = is_hero
-                first_check = True
-            else:
-                logger.debug(f"吊射模式状态未变化，当前状态: {'吊射' if is_hero else '非吊射'}")
+            # [链路职责隔离]
+            # 官方图传使用 UDP(HEVC) 直传，不走 MQTT 图像分发。
+            if not self.normal_source.running:
+                logger.info("启用UDP图传数据源")
+                self.normal_source.start()
+
+            if self.mqtt_source.running:
+                logger.info("关闭MQTT图传数据源（MQTT仅用于状态/自定义数据）")
+                self.mqtt_source.stop()
 
             self._stop_event.wait(1.0)
             

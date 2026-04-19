@@ -61,7 +61,17 @@ def index():
     return render_template('index.html')
 
 if __name__ == '__main__':
-    service = CoreService(side=consts.Sides.RED, robot=consts.RobotTypes.INFANTRY, infantry_select=1)
+    # [部署约束]
+    # 官方协议下 MQTT 服务端固定为 192.168.12.1:3333，
+    # 而 UDP 图传接收必须绑定本机地址（建议 0.0.0.0 监听所有网卡）。
+    # 两者语义不同，禁止复用为同一个 host 参数。
+    service = CoreService(
+        side=consts.Sides.RED,
+        robot=consts.RobotTypes.HERO,
+        infantry_select=0,
+        mqtt_host="192.168.12.1", 
+        udp_bind_host="0.0.0.0",
+    )
     service.run(blocking=False)
 
     try:
