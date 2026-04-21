@@ -36,6 +36,7 @@ class CoreService:
         self.mqtt_source = MqttImgSource(mqtt=self.core_mqtt)  # 将MQTT客户端实例传入图传数据源，使其能够直接从MQTT消息中获取图像数据
         self._stop_event = threading.Event()
         self._mode_monitor_thread: threading.Thread = threading.Thread(target=self._mode_monitor_loop, daemon=True)
+        self._source_switch_lock = threading.Lock()
         self.if_mqtt_source = False
         # self.main_method = main_method
         # self.main_method_args = main_method_args
@@ -64,38 +65,78 @@ class CoreService:
 
     def _mode_monitor_loop(self):
         """根据 DeployModeStatusSync 动态切换图传数据源。"""
-        if not self.test_config.if_test:
-            first_check = False
-            while not self._stop_event.is_set():
+        current_policy: str | None = None
+        while not self._stop_event.is_set():
+            if self.test_config.if_test:
+                if self.test_config.if_mqtt_source:
+                    assert self.test_config.if_udp_source is False, "测试配置错误：MQTT和UDP数据源不能同时启用"
+                    if current_policy != "test_mqtt":
+                        logger.warning("测试配置：启用MQTT图传数据源")
+                        self._apply_source(use_mqtt=True, reason="测试模式")
+                        current_policy = "test_mqtt"
+                elif self.test_config.if_udp_source:
+                    assert self.test_config.if_mqtt_source is False, "测试配置错误：MQTT和UDP数据源不能同时启用"
+                    if current_policy != "test_udp":
+                        logger.warning("测试配置：启用UDP图传数据源")
+                        self._apply_source(use_mqtt=False, reason="测试模式")
+                        current_policy = "test_udp"
+                else:
+                    if current_policy != "test_none":
+                        logger.warning("测试配置：未启用任何图传数据源，生成器将无法获取视频帧")
+                        with self._source_switch_lock:
+                            self.mqtt_source.stop()
+                            self.normal_source.stop()
+                        current_policy = "test_none"
+            else:
                 if_mqtt_source_cur = self.core_mqtt.state_manager.get("DeployModeStatusSync", "status") == 1
-                if if_mqtt_source_cur != self.if_mqtt_source or not first_check:
+                next_policy = "auto_mqtt" if if_mqtt_source_cur else "auto_udp"
+                if current_policy != next_policy:
                     if if_mqtt_source_cur:
                         logger.info("检测到吊射模式，启用MQTT图传数据源")
-                        self.mqtt_source.start()
-                        self.normal_source.stop()  # 确保另一个数据源停止
                     else:
                         logger.info("未检测到吊射模式，启用UDP图传数据源")
-                        self.normal_source.start()
-                        self.mqtt_source.stop()  # 确保另一个数据源停止
-                    self.if_mqtt_source = if_mqtt_source_cur
-                    first_check = True
+                    self._apply_source(use_mqtt=if_mqtt_source_cur, reason="自动模式")
+                    current_policy = next_policy
                 else:
                     logger.debug(f"吊射模式状态未变化，当前状态: {'吊射' if if_mqtt_source_cur else '非吊射'}")
-                self._stop_event.wait(1.0)
-        else:
-            logger.warning("测试模式：跳过 DeployModeStatusSync 检测，直接根据测试配置启用图传数据源")
-            if self.test_config.if_mqtt_source:
-                logger.warning("测试配置：直接启用MQTT图传数据源")
+
+            self._stop_event.wait(1.0)
+
+    def _apply_source(self, use_mqtt: bool, reason: str = ""):
+        """立即切换图传源，并保持互斥。"""
+        with self._source_switch_lock:
+            if use_mqtt:
                 self.mqtt_source.start()
+                self.normal_source.stop()
                 self.if_mqtt_source = True
-                assert self.test_config.if_udp_source == False, "测试配置错误：MQTT和UDP数据源不能同时启用"
-            elif self.test_config.if_udp_source:
-                logger.warning("测试配置：直接启用UDP图传数据源")
-                self.normal_source.start()
-                self.if_mqtt_source = False
-                assert self.test_config.if_mqtt_source == False, "测试配置错误：MQTT和UDP数据源不能同时启用"
+                logger.warning(f"图传源已切换为 MQTT{f'（{reason}）' if reason else ''}")
             else:
-                logger.warning("测试配置：未启用任何图传数据源，生成器将无法获取视频帧")
+                self.normal_source.start()
+                self.mqtt_source.stop()
+                self.if_mqtt_source = False
+                logger.warning(f"图传源已切换为 UDP{f'（{reason}）' if reason else ''}")
+
+    def use_mqtt_source_for_test(self):
+        """测试模式下立即切换为 MQTT 图传源。"""
+        self.test_config.if_test = True
+        self.test_config.if_mqtt_source = True
+        self.test_config.if_udp_source = False
+        self._apply_source(use_mqtt=True, reason="测试模式")
+
+    def use_udp_source_for_test(self):
+        """测试模式下立即切换为 UDP 图传源。"""
+        self.test_config.if_test = True
+        self.test_config.if_mqtt_source = False
+        self.test_config.if_udp_source = True
+        self._apply_source(use_mqtt=False, reason="测试模式")
+
+    def disable_test_mode(self):
+        """关闭测试模式，并按 DeployModeStatusSync 立即恢复自动策略。"""
+        self.test_config.if_test = False
+        self.test_config.if_mqtt_source = False
+        self.test_config.if_udp_source = False
+        auto_use_mqtt = self.core_mqtt.state_manager.get("DeployModeStatusSync", "status") == 1
+        self._apply_source(use_mqtt=auto_use_mqtt, reason="恢复自动模式")
     
     def start(self):
         """核心启动逻辑"""
@@ -105,15 +146,16 @@ class CoreService:
 
         self._stop_event.clear()
         self.core_mqtt.start()
+        self._mode_monitor_thread = threading.Thread(target=self._mode_monitor_loop, daemon=True)
         self._mode_monitor_thread.start()
 
-    def run(self, blocking: bool = True):
-        """启动服务，默认阻塞当前线程保持运行，直到收到退出信号。"""
+    def run(self, blocking: bool = True) -> bool:
+        """启动服务，默认阻塞当前线程保持运行，直到收到退出信号。返回是否启动成功。"""
         try:
             self.start()
             if not blocking:
                 logger.info("CoreService 已在后台启动（非阻塞模式）")
-                return
+                return True
             # if self.main_method:
             #     logger.info("主线程方法开始执行，CoreService 将继续保持运行，等待退出信号...")
             #     # main_method（如 Flask app.run）通常是阻塞调用，返回即视为主线程方法结束。
@@ -123,10 +165,11 @@ class CoreService:
             #     return
             while not self._stop_event.is_set():
                 time.sleep(0.5)
+            return True
         except KeyboardInterrupt:
             logger.warning("收到退出信号，正在关闭 CoreService...")
-            # exit()
             self.stop()
+            return False
 
     def stop(self):
         self._stop_event.set()
@@ -172,13 +215,13 @@ class CoreService:
         """检查核心服务的基本运行状态，便于外部调用时快速判断服务是否正常工作。"""
         mqtt_alive: bool = self.core_mqtt.client.is_connected()
         try:
-            _ = self.normal_source.sock.getpeername()
+            _ = self.normal_source.sock.getsockname()
             udp_alive = True
         except Exception:
             udp_alive = False
-        udp_source_alive: bool = bool(self.normal_source.decode_thread.is_alive) if self.normal_source.decode_thread else False
-        mqtt_source_alive: bool = bool(self.mqtt_source.decode_thread.is_alive) if self.mqtt_source.decode_thread else False
-        dynamic_switch_alive: bool = bool(self._mode_monitor_thread.is_alive) if self._mode_monitor_thread else False
+        udp_source_alive: bool = bool(self.normal_source.decode_thread.is_alive()) if self.normal_source.decode_thread else False
+        mqtt_source_alive: bool = bool(self.mqtt_source.decode_thread.is_alive()) if self.mqtt_source.decode_thread else False
+        dynamic_switch_alive: bool = bool(self._mode_monitor_thread.is_alive()) if self._mode_monitor_thread else False
         print(f"MQTT 连接状态: {mqtt_alive}\nUDP socket状态: {udp_alive}\nMQTT 链路解码线程状态: {mqtt_source_alive}\nUDP 链路解码线程状态: {udp_source_alive}\n当前图传数据源: {'MQTT' if self.if_mqtt_source else 'UDP'}\n图传源服务动态切换线程状态:{dynamic_switch_alive}")
 
     def print_current_source(self):

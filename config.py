@@ -34,15 +34,14 @@ class Config:
     # message_queue_size: int = 1000
     
     # 日志配置
-    IF_LOG = True
+    IF_LOG: bool = True
     BASE_DIR: Path = Path(__file__).parent
     LOG_DIR: Path = BASE_DIR / "tools" / "logs_content"
     LOG_DIR.mkdir(exist_ok=True)
     RECORD_LOG: bool = False
-    LEVEL = "INFO"  # 可选: DEBUG, INFO, WARNING, ERROR, CRITICAL
+    LEVEL: str = "INFO"  # 可选: DEBUG, INFO, WARNING, ERROR, CRITICAL
 
     # @property
     # def mqtt_client_id(self) -> str:
     #     return f"custom_client_{self.port}"
 
-    

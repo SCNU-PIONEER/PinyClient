@@ -108,7 +108,7 @@ class Layer:
         if suffix:
             result += f"({self.name}) " + suffix
         else:
-            result += f"({self.name}) 输入'q'返回上一级菜单，输入'?'或 '?+选项编号'查看选项说明。"
+            result += f"({self.name}) 'q': 返回上一级菜单; '?'或'?+选项编号': 查看选项说明; Ctrl+D: 退出程序"
         return result, lines
 
     def get_parent(self) -> 'Layer':

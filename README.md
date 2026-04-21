@@ -64,9 +64,9 @@ pip install requirements.txt
 
 ### 测试说明
 - 在`app.py`中，修改CoreService的配置项`consts.TestConfig(if_test=True, if_mqtt_source=True)`，具体配置项在`consts.TestConfig`中
-- 若不希望flask阻碍主线程，可设置`start_flask(blocking=False)`
-- 若不希望日志输出到命令行或希望修改日志level，请在`config.Config`中修改
-- 本项目目前暂不完全支持测试功能
+<!-- - 若不希望flask阻碍主线程，可设置`start_flask(blocking=False)` -->
+<!-- - 若不希望日志输出到命令行或希望修改日志level，请在`config.Config`中修改 -->
+- 目前可用`start_log_or_console(service, start_log=False)`，启用命令行功能（若为start_log=True，则启动普通日志功能）
 
 ### 文件目录说明
 

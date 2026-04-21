@@ -1,12 +1,11 @@
 import logging
 import os
 import sys
+import threading
 from collections import deque
 from typing import List
 sys.path.append("..")  # 添加项目根目录到sys.path，方便导入模块
 from config import Config  # pyright: ignore[reportImplicitRelativeImport]
-
-RECORD_LOG, LOG_DIR = Config.RECORD_LOG, Config.LOG_DIR
 
 # ============================================================
 # 彩色日志
@@ -32,6 +31,10 @@ class CircularLogBuffer:
 
 class RMColorLogger:
     """彩色日志生成器, 支持分组配色方案; 在命令行使用$env:PIONEER_LOG_LEVEL = "DEBUG"命令 """
+
+    _instances: list['RMColorLogger'] = []
+    _global_lock = threading.Lock()
+    _global_buffer = deque(maxlen=2000)
 
     # 基础色
     C: dict[str, str]= {
@@ -142,6 +145,7 @@ class RMColorLogger:
         self._logger = logging.getLogger(name)
         self._buffer = CircularLogBuffer(maxlen=30)
         self._configure()
+        self.__class__._instances.append(self)
 
     def _configure(self):
         fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(lineno)d | %(message)s"
@@ -164,10 +168,10 @@ class RMColorLogger:
             self._logger.addHandler(handler)
             
             # 文件处理
-            if RECORD_LOG:
+            if Config.RECORD_LOG:
                 import time
                 log_name = f"{self.name}_{time.strftime('%Y_%m_%d')}.log"
-                log_path = os.path.join(LOG_DIR, log_name)
+                log_path = os.path.join(Config.LOG_DIR, log_name)
                 if not os.path.exists(os.path.dirname(log_path)):
                     os.makedirs(os.path.dirname(log_path))
 
@@ -175,6 +179,12 @@ class RMColorLogger:
                 file_handler.setLevel(logging.DEBUG)
                 file_handler.setFormatter(self.MultiColorFormatter(fmt, datefmt=datefmt))
                 self._logger.addHandler(file_handler)
+
+    @classmethod
+    def reload_all_loggers(cls):
+        """根据当前 Config 重新配置已创建 logger。"""
+        for instance in cls._instances:
+            instance._configure()
 
     def _create_buffer_handler(self, fmt: str, datefmt: str):
         """创建用于缓冲的handler"""
@@ -185,7 +195,10 @@ class RMColorLogger:
                 self.setFormatter(RMColorLogger.MultiColorFormatter(fmt, datefmt=datefmt))
             
             def emit(self, record):
-                self.buffer.add(self.format(record))
+                formatted = self.format(record)
+                self.buffer.add(formatted)
+                with RMColorLogger._global_lock:
+                    RMColorLogger._global_buffer.append(formatted)
         
         return BufferHandler(self._buffer)
 
@@ -209,31 +222,22 @@ class RMColorLogger:
         kwargs.setdefault("stacklevel", 2)
         self._logger.critical(msg, *args, **kwargs)
 
-    def set_level(self, level_str: str):
-        self._logger.setLevel(getattr(logging, level_str.upper(), logging.INFO))
-        self.info(f"日志级别已设置为 {level_str.upper()}")
+    @classmethod
+    def set_global_level(cls, level_str: str):
+        """设置所有 RMColorLogger 的日志级别，并更新默认配置级别。"""
+        normalized = level_str.upper()
+        level_value = getattr(logging, normalized, logging.INFO)
+        Config.LEVEL = normalized
+        for instance in cls._instances:
+            instance._logger.setLevel(level_value)
 
-    def get_buffered_logs(self) -> List[str]:
-        """获取当前缓冲区中的日志消息，返回一个列表并清空缓冲区。"""
-        logs = self._buffer.get_all()
-        self._buffer.clear()
-        return logs
-
-    def print_buffered_logs(self):
-        """打印当前缓冲区中的日志消息，并清空缓冲区。"""
-        logs = self.get_buffered_logs()
-        for log in logs:
-            print(log)
-
-    def get_recent_logs(self, n: int) -> List[str]:
-        """获取最近n条日志"""
-        return self._buffer.get_last(n)
-
-    def print_recent_logs(self, n: int):
-        """打印最近n条日志"""
-        logs = self.get_recent_logs(n)
-        for log in logs:
-            print(log)
+    @classmethod
+    def get_global_recent_logs(cls, n: int = 30) -> List[str]:
+        """只读获取全局最近n条日志，不清空缓冲区。"""
+        if n <= 0:
+            return []
+        with cls._global_lock:
+            return list(cls._global_buffer)[-n:]
 
 if __name__ == "__main__":
 
@@ -243,6 +247,5 @@ if __name__ == "__main__":
     logger.warning("test")
     logger.error("test")
     logger.critical("test")
-    # print(logger.get_buffered_logs())
-    for log in logger.get_recent_logs(5):
+    for log in RMColorLogger.get_global_recent_logs(5):
         print(log)

@@ -170,6 +170,9 @@ class RMMQTTClient:
             try:
                 self.client.connect(self.host, self.port)
                 break
+            except KeyboardInterrupt:
+                logger.warning(f"MQTT: {self.description} 连接被用户中断")
+                raise
             except Exception as e:
                 logger.error(f"MQTT: {self.description} 连接失败: {e}, 5秒后重试...")
                 time.sleep(5)  # 等待5秒后重试

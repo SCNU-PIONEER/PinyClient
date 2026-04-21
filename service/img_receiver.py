@@ -371,20 +371,10 @@ class NormalImgSource(ImgSource):
         super().__init__()
         self._bind_host = host
         self._bind_port = port
-        self.decode_thread = threading.Thread(target=self._decode_loop, daemon=True)
+        self.decode_thread: Optional[threading.Thread] = None
         self.packet_queue: Queue[bytes] = Queue(maxsize=RTP_QUEUE_MAXSIZE)
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self.sock.bind((host, port))
-        except Exception as e:
-            self.sock.close()
-            raise RuntimeError(
-                f"无法绑定UDP端口 {host}:{port}，该端口可能已被其他进程占用。错误信息: {e}"
-            )
-        self.sock.settimeout(1.0)
-        logger.info(f"UDP接收器已绑定到 {self.sock.getsockname()}")
+        self.sock: Optional[socket.socket] = None
+        self._create_and_bind_socket()
 
         self.pipeline = Gst.parse_launch(
             "appsrc name=hevc_source is-live=true format=time do-timestamp=false "
@@ -400,6 +390,26 @@ class NormalImgSource(ImgSource):
         self.appsrc.set_property("block", False)
         self.appsink.connect("new-sample", self._on_hevc_new_sample)
         self.bus = self.pipeline.get_bus()
+
+    def _create_and_bind_socket(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sock.bind((self._bind_host, self._bind_port))
+        except Exception as e:
+            self.sock.close()
+            self.sock = None
+            raise RuntimeError(
+                f"无法绑定UDP端口 {self._bind_host}:{self._bind_port}，该端口可能已被其他进程占用。错误信息: {e}"
+            )
+        self.sock.settimeout(1.0)
+        logger.info(f"UDP接收器已绑定到 {self.sock.getsockname()}")
 
     def _drain_packet_queue(self):
         while True:
@@ -508,6 +518,10 @@ class NormalImgSource(ImgSource):
             time.sleep(0.001)
 
     def _receive_loop(self):
+        if self.sock is None:
+            logger.error("UDP socket 未初始化，无法启动接收循环")
+            return
+
         logger.info(f"3334 UDP接收循环已启动，监听{self.sock.getsockname()}，等待数据包...")
         while self.running:
             try:
@@ -546,7 +560,14 @@ class NormalImgSource(ImgSource):
             logger.warning("UDP服务器已经在运行")
             return
 
-        bound_host, bound_port = self.sock.getsockname()
+        if self.sock is None:
+            self._create_and_bind_socket()
+
+        try:
+            bound_host, bound_port = self.sock.getsockname() # pyright: ignore[reportOptionalMemberAccess]
+        except OSError:
+            self._create_and_bind_socket()
+            bound_host, bound_port = self.sock.getsockname() # pyright: ignore[reportOptionalMemberAccess]
         if bound_port != self._bind_port:
             raise RuntimeError(
                 f"UDP套接字绑定异常，期望端口 {self._bind_port}，实际 {bound_host}:{bound_port}"
@@ -556,6 +577,7 @@ class NormalImgSource(ImgSource):
         self.pipeline.set_state(Gst.State.PLAYING)
         self.running = True
         self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
+        self.decode_thread = threading.Thread(target=self._decode_loop, daemon=True)
         
         self.receive_thread.start()
         self.decode_thread.start()
@@ -574,7 +596,11 @@ class NormalImgSource(ImgSource):
 
         self.appsrc.emit("end-of-stream")
         self.pipeline.set_state(Gst.State.NULL)
-        self.sock.close()
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+        self.receive_thread = None
+        self.decode_thread = None
         logger.info("UDP服务器线程已停止")
 
 
