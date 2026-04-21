@@ -66,9 +66,20 @@ def index():
 def run_flask():
         # Flask 必须跑在主线程；关闭 reloader，避免开发重载导致 service 重复初始化。
     app.run(host='127.0.0.1', port=5000, use_reloader=False)
+    
 
+def start_flask(blocking=True):
+    if blocking:
+        run_flask()
+    else:
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
 
-def start_service():
+if __name__ == '__main__':
+    # [部署约束]
+    # 官方协议下 MQTT 服务端固定为 192.168.12.1:3333，
+    # 而 UDP 图传接收必须绑定本机地址（建议 0.0.0.0 监听所有网卡）。
+    # 两者语义不同，禁止复用为同一个 host 参数。
     global service
 
     service = CoreService(
@@ -83,19 +94,7 @@ def start_service():
     )
     service.run(blocking=False)
 
-    
-if __name__ == '__main__':
-    # [部署约束]
-    # 官方协议下 MQTT 服务端固定为 192.168.12.1:3333，
-    # 而 UDP 图传接收必须绑定本机地址（建议 0.0.0.0 监听所有网卡）。
-    # 两者语义不同，禁止复用为同一个 host 参数。
-    start_service()
-
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    while True:
-        time.sleep(1)
+    start_flask(blocking=True)
 
     """
      - 设计命令类（q=返回）
